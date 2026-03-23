@@ -63,7 +63,7 @@ def safe_phase_volume_fraction(result, phase_name):
 def get_present_phases_from_result(result):
     """
     Try several possible TC-Python method names.
-    If your version uses a different accessor, adjust here.
+    Depending on your TC-Python version, one of these may work.
     """
     candidate_method_names = [
         "get_stable_phases",
@@ -87,7 +87,6 @@ def get_present_phases_from_result(result):
             except Exception:
                 pass
 
-    # fallback
     return []
 
 
@@ -99,25 +98,24 @@ input_df = pd.read_csv(INPUT_FILE)
 if "Index" not in input_df.columns:
     input_df.insert(0, "Index", range(1, len(input_df) + 1))
 
-# Force numeric chemistry columns
 for col in CHEM_COLS:
     input_df[col] = pd.to_numeric(input_df[col], errors="coerce")
 
-# optional: remove rows with missing chemistry
 bad_rows = input_df[input_df[CHEM_COLS].isna().any(axis=1)].copy()
 input_df = input_df.dropna(subset=CHEM_COLS).copy()
 
 print("Valid alloys loaded:", len(input_df))
+
 if len(bad_rows) > 0:
-    print("Rows skipped because of non-numeric / missing chemistry:")
+    print("Rows skipped because of missing/non-numeric chemistry:")
     print(bad_rows[["Index"] + CHEM_COLS])
 
 
 # ==================================================
-# MAIN
+# MAIN CALCULATION
 # ==================================================
 scan_rows = []
-start_tracker = {}
+start_tracker = {}       # key = (alloy_id, phase_name) -> first start temperature in C
 all_detected_phases = set()
 error_rows = []
 
@@ -128,7 +126,6 @@ with TCPython() as session:
         alloy_id = row["Index"]
         composition = build_composition_from_row(row)
 
-        # sanity check
         sum_solutes = sum(composition.values())
         if sum_solutes >= 1.0:
             error_rows.append({
@@ -161,23 +158,18 @@ with TCPython() as session:
 
             present_phases = get_present_phases_from_result(result)
 
-            # if auto-detection returns nothing, fall back by probing a broad set
-            # Add candidate phases here only if you want a backup path
             for ph in present_phases:
                 all_detected_phases.add(ph)
 
             scan_row = {
                 "Alloy_ID": alloy_id,
-                "Temperature_C": T_C,
-                "Temperature_K": T_K
+                "Temperature_C": T_C
             }
 
-            for col in input_df.columns:
-                scan_row[col] = row[col]
-
+            # Save phase volume fractions only
             for ph in present_phases:
                 vf = safe_phase_volume_fraction(result, ph)
-                scan_row[ph] = vf * 100.0
+                scan_row[ph] = vf * 100.0   # vol.%
 
                 key = (alloy_id, ph)
                 if key not in start_tracker and vf > PHASE_THRESHOLD:
@@ -187,11 +179,12 @@ with TCPython() as session:
 
 
 # ==================================================
-# BUILD OUTPUTS
+# BUILD Phase_vs_Temperature
 # ==================================================
 df_scan = pd.DataFrame(scan_rows)
 
 all_detected_phases = sorted(all_detected_phases)
+
 for ph in all_detected_phases:
     if ph not in df_scan.columns:
         df_scan[ph] = 0.0
@@ -199,34 +192,49 @@ for ph in all_detected_phases:
 if len(df_scan) > 0 and all_detected_phases:
     df_scan[all_detected_phases] = df_scan[all_detected_phases].fillna(0.0)
 
-input_cols = list(input_df.columns)
+# Remove phases that are zero everywhere in Phase_vs_Temperature
+phase_cols_nonzero_scan = []
+for ph in all_detected_phases:
+    if len(df_scan) > 0 and (df_scan[ph] > 0).any():
+        phase_cols_nonzero_scan.append(ph)
 
 if len(df_scan) > 0:
-    df_scan = df_scan[["Alloy_ID", "Temperature_C", "Temperature_K"] + input_cols + all_detected_phases]
+    df_scan = df_scan[["Alloy_ID", "Temperature_C"] + phase_cols_nonzero_scan]
 
+
+# ==================================================
+# BUILD Start_Temperatures
+# one row per alloy, phases as columns
+# ==================================================
 start_rows = []
+
 for _, row in input_df.iterrows():
     alloy_id = row["Index"]
-    for ph in all_detected_phases:
-        T_C = start_tracker.get((alloy_id, ph), None)
+    out = {"Alloy_ID": alloy_id}
 
-        out = {
-            "Alloy_ID": alloy_id,
-            "Phase": ph,
-            "Start_Temperature_C": T_C,
-            "Start_Temperature_K": (T_C + 273.15) if T_C is not None else None
-        }
-        for col in input_df.columns:
-            out[col] = row[col]
+    for ph in phase_cols_nonzero_scan:
+        out[ph] = start_tracker.get((alloy_id, ph), None)
 
-        start_rows.append(out)
+    start_rows.append(out)
 
 df_start = pd.DataFrame(start_rows)
-if len(df_start) > 0:
-    df_start = df_start[["Alloy_ID", "Phase", "Start_Temperature_C", "Start_Temperature_K"] + input_cols]
 
+if len(df_start) > 0:
+    # Remove phases that are NaN for all alloys
+    phase_cols_nonempty_start = [ph for ph in phase_cols_nonzero_scan if df_start[ph].notna().any()]
+    df_start = df_start[["Alloy_ID"] + phase_cols_nonempty_start]
+
+    # Optional: round start temperatures to integers
+    for ph in phase_cols_nonempty_start:
+        df_start[ph] = df_start[ph].round(0)
+
+
+# ==================================================
+# BUILD ERRORS
+# ==================================================
 df_errors = pd.DataFrame(error_rows)
 df_bad_rows = bad_rows.copy()
+
 
 # ==================================================
 # EXPORT
@@ -234,12 +242,15 @@ df_bad_rows = bad_rows.copy()
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     if len(df_scan) > 0:
         df_scan.to_excel(writer, sheet_name="Phase_vs_Temperature", index=False)
+
     if len(df_start) > 0:
         df_start.to_excel(writer, sheet_name="Start_Temperatures", index=False)
+
     if len(df_errors) > 0:
         df_errors.to_excel(writer, sheet_name="Errors", index=False)
+
     if len(df_bad_rows) > 0:
         df_bad_rows.to_excel(writer, sheet_name="Bad_Input_Rows", index=False)
 
 print(f"\nDone. Results exported to: {OUTPUT_FILE}")
-print("Detected phases:", all_detected_phases)
+print("Phases kept in output:", list(df_start.columns[1:]) if len(df_start) > 0 else [])
