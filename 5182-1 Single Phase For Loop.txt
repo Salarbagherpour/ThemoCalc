@@ -1,0 +1,28 @@
+from tc_python import *
+import numpy as np
+from matplotlib import pyplot as plt
+
+with TCPython() as session:
+    system = session.select_database_and_elements("TCAL8", ["AL", "Si", "Fe", "Cu", "Mn", "Mg"]).get_system()
+    calculator = system.with_single_equilibrium_calculation()
+
+    Mg_Contents=np.arange(1.5, 3.4, 0.1)
+    (calculator
+        .set_condition("T", 100 + 273.15)
+        .set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Si"), 0.0028)
+        .set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Fe"), 0.0053)
+        .set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Cu"), 0.0018)
+        .set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Mn"), 0.0086))
+
+    Volume_Frac_Al13Fe4 = []
+    for Mg_Content in Mg_Contents:
+        calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Mg"), Mg_Content/100)
+
+        result = calculator.calculate()
+
+        VF_Al13Fe4 = (result.get_value_of(ThermodynamicQuantity.volume_fraction_of_a_phase("Al13FE4"))*100)
+        Volume_Frac_Al13Fe4.append(VF_Al13Fe4)
+    plt.plot(Mg_Contents,Volume_Frac_Al13Fe4)
+    plt.xlabel("Mg_Contents(wt%)")
+    plt.ylabel("VF(%)_Al13Fe4")
+    plt.show()
