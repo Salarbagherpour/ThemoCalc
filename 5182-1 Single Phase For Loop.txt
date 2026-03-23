@@ -1,3 +1,4 @@
+# Equi both phase quantity and Start Temp for serise of composition 
 from tc_python import *
 import pandas as pd
 import numpy as np
