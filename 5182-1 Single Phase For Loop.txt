@@ -8,62 +8,38 @@ import numpy as np
 DATABASE = "TCAL10"
 ELEMENTS = ["AL", "SI", "FE", "CU", "MN", "MG", "CR"]
 
-INPUT_FILE = "6000.csv"   # CSV with wt.% composition rows
+INPUT_FILE = "6000.csv"
 OUTPUT_FILE = "phase_results_all_alloys_auto_phases.xlsx"
 
-# Temperature scan range (°C)
 T_START_C = 700
 T_END_C = 25
 T_STEP_C = 5
 
-# Threshold for considering that a phase really exists
-# Used for start-temperature detection and filtering tiny numerical noise
-PHASE_THRESHOLD = 1e-6   # fraction, not percent
+PHASE_THRESHOLD = 1e-6
 
-# Optional: phases you do NOT want in outputs even if they appear
-# Add/remove names depending on your database behavior
-EXCLUDED_PHASES = {
-    "GAS",
-    "IONIC_LIQ",
-    "LIQUID"
-}
+EXCLUDED_PHASES = {"GAS", "IONIC_LIQ", "LIQUID"}
+
+CHEM_COLS = ["Cu", "Fe", "Mg", "Mn", "Si", "Cr"]
 
 
 # ==================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ==================================================
 def build_composition_from_row(row):
     """
-    Read one alloy row from CSV and convert wt.% -> mass fraction.
-    Expected columns: Cu, Fe, Mg, Mn, Si, Cr (case-sensitive here).
-    Missing values are treated as 0.
+    Convert wt.% -> mass fraction
     """
-    column_map = {
-        "SI": "Si",
-        "FE": "Fe",
-        "CU": "Cu",
-        "MN": "Mn",
-        "MG": "Mg",
-        "CR": "Cr"
+    return {
+        "CU": float(row["Cu"]) / 100.0,
+        "FE": float(row["Fe"]) / 100.0,
+        "MG": float(row["Mg"]) / 100.0,
+        "MN": float(row["Mn"]) / 100.0,
+        "SI": float(row["Si"]) / 100.0,
+        "CR": float(row["Cr"]) / 100.0
     }
-
-    comp = {}
-    for el, col_name in column_map.items():
-        value_wt_pct = row[col_name] if col_name in row.index else 0.0
-        if pd.isna(value_wt_pct):
-            value_wt_pct = 0.0
-
-        # wt.% -> mass fraction
-        comp[el] = float(value_wt_pct) / 100.0
-
-    return comp
 
 
 def set_composition_conditions(calculator, composition_dict):
-    """
-    Set Thermo-Calc composition conditions using mass fraction.
-    AL remains balance automatically.
-    """
     for el, val in composition_dict.items():
         calculator.set_condition(
             ThermodynamicQuantity.mass_fraction_of_a_component(el),
@@ -73,17 +49,11 @@ def set_composition_conditions(calculator, composition_dict):
 
 
 def safe_phase_volume_fraction(result, phase_name):
-    """
-    Return phase volume fraction between 0 and 1.
-    If absent / invalid / unavailable, return 0.0.
-    """
     try:
         value = result.get_value_of(
             ThermodynamicQuantity.volume_fraction_of_a_phase(phase_name)
         )
-        if value is None:
-            return 0.0
-        if np.isnan(value):
+        if value is None or np.isnan(value):
             return 0.0
         return max(0.0, float(value))
     except Exception:
@@ -92,16 +62,9 @@ def safe_phase_volume_fraction(result, phase_name):
 
 def get_present_phases_from_result(result):
     """
-    Try to discover which phases are present/stable in this equilibrium result.
-
-    IMPORTANT:
-    The exact API accessor name can vary between TC-Python versions.
-    This function tries several common patterns.
-
-    Returns:
-        sorted list of phase names
+    Try several possible TC-Python method names.
+    If your version uses a different accessor, adjust here.
     """
-    # ---- Pattern 1: direct stable phases accessor on result
     candidate_method_names = [
         "get_stable_phases",
         "get_present_phases",
@@ -117,71 +80,46 @@ def get_present_phases_from_result(result):
             try:
                 value = attr() if callable(attr) else attr
                 if value is not None:
-                    phases = list(value)
-                    phases = [str(p) for p in phases]
+                    phases = [str(p) for p in list(value)]
                     phases = [p for p in phases if p and p not in EXCLUDED_PHASES]
-                    if len(phases) > 0:
+                    if phases:
                         return sorted(set(phases))
             except Exception:
                 pass
 
-    # ---- Pattern 2: quantities object / grouped result object
-    nested_names = [
-        "get_quantities",
-        "quantities",
-        "get_result_quantities",
-        "result_quantities"
-    ]
-
-    for nested in nested_names:
-        if hasattr(result, nested):
-            try:
-                nested_obj = getattr(result, nested)
-                nested_obj = nested_obj() if callable(nested_obj) else nested_obj
-
-                for name in candidate_method_names:
-                    if hasattr(nested_obj, name):
-                        attr = getattr(nested_obj, name)
-                        try:
-                            value = attr() if callable(attr) else attr
-                            if value is not None:
-                                phases = list(value)
-                                phases = [str(p) for p in phases]
-                                phases = [p for p in phases if p and p not in EXCLUDED_PHASES]
-                                if len(phases) > 0:
-                                    return sorted(set(phases))
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-    # ---- Fallback:
-    # If your TC-Python version uses a different method name, inspect 'dir(result)'
-    # in PyCharm and replace this helper accordingly.
-    raise RuntimeError(
-        "Could not automatically retrieve present phases from the TC-Python result object. "
-        "Check available methods with dir(result) in your version and update get_present_phases_from_result()."
-    )
+    # fallback
+    return []
 
 
 # ==================================================
-# READ INPUT CSV
+# READ / CLEAN INPUT
 # ==================================================
 input_df = pd.read_csv(INPUT_FILE)
 
 if "Index" not in input_df.columns:
     input_df.insert(0, "Index", range(1, len(input_df) + 1))
 
-print("Loaded input alloys:")
-print(input_df.head())
+# Force numeric chemistry columns
+for col in CHEM_COLS:
+    input_df[col] = pd.to_numeric(input_df[col], errors="coerce")
+
+# optional: remove rows with missing chemistry
+bad_rows = input_df[input_df[CHEM_COLS].isna().any(axis=1)].copy()
+input_df = input_df.dropna(subset=CHEM_COLS).copy()
+
+print("Valid alloys loaded:", len(input_df))
+if len(bad_rows) > 0:
+    print("Rows skipped because of non-numeric / missing chemistry:")
+    print(bad_rows[["Index"] + CHEM_COLS])
 
 
 # ==================================================
-# MAIN CALCULATION
+# MAIN
 # ==================================================
 scan_rows = []
-start_tracker = {}   # key = (alloy_id, phase_name), value = first T_C
+start_tracker = {}
 all_detected_phases = set()
+error_rows = []
 
 with TCPython() as session:
     system = session.select_database_and_elements(DATABASE, ELEMENTS).get_system()
@@ -190,22 +128,41 @@ with TCPython() as session:
         alloy_id = row["Index"]
         composition = build_composition_from_row(row)
 
-        print(f"\nRunning alloy {alloy_id}")
-        print("Composition (mass fraction):", composition)
+        # sanity check
+        sum_solutes = sum(composition.values())
+        if sum_solutes >= 1.0:
+            error_rows.append({
+                "Alloy_ID": alloy_id,
+                "Temperature_C": None,
+                "Error": f"Sum of solute mass fractions >= 1.0 ({sum_solutes:.6f})"
+            })
+            continue
+
+        print(f"\nRunning alloy {alloy_id} ...")
 
         for T_C in np.arange(T_START_C, T_END_C - T_STEP_C, -T_STEP_C):
             T_K = T_C + 273.15
 
-            calculator = system.with_single_equilibrium_calculation()
-            calculator.set_condition("T", T_K)
-            calculator = set_composition_conditions(calculator, composition)
+            try:
+                calculator = system.with_single_equilibrium_calculation()
+                calculator.set_condition("T", T_K)
+                calculator = set_composition_conditions(calculator, composition)
 
-            result = calculator.calculate()
+                result = calculator.calculate()
 
-            # Automatically discover present/stable phases from Thermo-Calc result
+            except Exception as e:
+                error_rows.append({
+                    "Alloy_ID": alloy_id,
+                    "Temperature_C": T_C,
+                    "Error": str(e)
+                })
+                print(f"ERROR in alloy {alloy_id} at {T_C} °C: {e}")
+                continue
+
             present_phases = get_present_phases_from_result(result)
 
-            # Keep union of all phases detected in the whole run
+            # if auto-detection returns nothing, fall back by probing a broad set
+            # Add candidate phases here only if you want a backup path
             for ph in present_phases:
                 all_detected_phases.add(ph)
 
@@ -215,15 +172,12 @@ with TCPython() as session:
                 "Temperature_K": T_K
             }
 
-            # Copy original input columns
             for col in input_df.columns:
                 scan_row[col] = row[col]
 
-            # Save only detected present phases at this temperature
-            # plus their volume fractions
             for ph in present_phases:
                 vf = safe_phase_volume_fraction(result, ph)
-                scan_row[ph] = vf * 100.0   # vol.%
+                scan_row[ph] = vf * 100.0
 
                 key = (alloy_id, ph)
                 if key not in start_tracker and vf > PHASE_THRESHOLD:
@@ -233,60 +187,59 @@ with TCPython() as session:
 
 
 # ==================================================
-# BUILD DATAFRAMES
+# BUILD OUTPUTS
 # ==================================================
 df_scan = pd.DataFrame(scan_rows)
 
-# Ensure every detected phase exists as a column, even if absent in some rows
 all_detected_phases = sorted(all_detected_phases)
 for ph in all_detected_phases:
     if ph not in df_scan.columns:
-        df_scan[ph] = np.nan
+        df_scan[ph] = 0.0
 
-# Fill missing phase values with 0.0 because phase not present at that row/T
-df_scan[all_detected_phases] = df_scan[all_detected_phases].fillna(0.0)
+if len(df_scan) > 0 and all_detected_phases:
+    df_scan[all_detected_phases] = df_scan[all_detected_phases].fillna(0.0)
 
-# Reorder columns
 input_cols = list(input_df.columns)
-scan_cols = ["Alloy_ID", "Temperature_C", "Temperature_K"] + input_cols + all_detected_phases
-df_scan = df_scan[scan_cols]
 
-# Build start temperature table
+if len(df_scan) > 0:
+    df_scan = df_scan[["Alloy_ID", "Temperature_C", "Temperature_K"] + input_cols + all_detected_phases]
+
 start_rows = []
 for _, row in input_df.iterrows():
     alloy_id = row["Index"]
-
     for ph in all_detected_phases:
         T_C = start_tracker.get((alloy_id, ph), None)
 
-        start_row = {
+        out = {
             "Alloy_ID": alloy_id,
             "Phase": ph,
             "Start_Temperature_C": T_C,
             "Start_Temperature_K": (T_C + 273.15) if T_C is not None else None
         }
-
         for col in input_df.columns:
-            start_row[col] = row[col]
+            out[col] = row[col]
 
-        start_rows.append(start_row)
+        start_rows.append(out)
 
 df_start = pd.DataFrame(start_rows)
-start_cols = ["Alloy_ID", "Phase", "Start_Temperature_C", "Start_Temperature_K"] + input_cols
-df_start = df_start[start_cols]
+if len(df_start) > 0:
+    df_start = df_start[["Alloy_ID", "Phase", "Start_Temperature_C", "Start_Temperature_K"] + input_cols]
 
+df_errors = pd.DataFrame(error_rows)
+df_bad_rows = bad_rows.copy()
 
 # ==================================================
-# EXPORT TO ONE EXCEL FILE WITH TWO SHEETS
+# EXPORT
 # ==================================================
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-    df_scan.to_excel(writer, sheet_name="Phase_vs_Temperature", index=False)
-    df_start.to_excel(writer, sheet_name="Start_Temperatures", index=False)
+    if len(df_scan) > 0:
+        df_scan.to_excel(writer, sheet_name="Phase_vs_Temperature", index=False)
+    if len(df_start) > 0:
+        df_start.to_excel(writer, sheet_name="Start_Temperatures", index=False)
+    if len(df_errors) > 0:
+        df_errors.to_excel(writer, sheet_name="Errors", index=False)
+    if len(df_bad_rows) > 0:
+        df_bad_rows.to_excel(writer, sheet_name="Bad_Input_Rows", index=False)
 
 print(f"\nDone. Results exported to: {OUTPUT_FILE}")
-print("Sheets created:")
-print(" - Phase_vs_Temperature")
-print(" - Start_Temperatures")
-print("\nDetected phases:")
-for ph in all_detected_phases:
-    print(" -", ph)
+print("Detected phases:", all_detected_phases)
