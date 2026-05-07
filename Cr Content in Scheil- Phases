@@ -1,0 +1,166 @@
+## Import required packages
+import numpy as np
+import pandas as pd
+import time
+from tc_python import *
+
+# Read input file
+df_inp = pd.read_csv('./6000.csv')
+print(list(df_inp.columns.values))
+
+inputs_list = ['Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
+input_frame = df_inp[inputs_list]
+input_frame_nonan = input_frame.dropna(axis=0)
+input_values = input_frame_nonan.values
+
+# Add Al balance
+al_content = 100 - np.sum(input_values, axis=1)
+al_content = np.reshape(al_content, (len(al_content), -1))
+
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+all_inputs_list = ['Al', 'Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
+df_combined_chemistries = pd.DataFrame(all_chemistries, columns=all_inputs_list)
+
+base = 'Al'
+elem = ['Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
+
+database = "TCAL10"
+t_start = 1000
+t_step = 1.0
+min_liq = 0.005
+
+start_api_server()
+
+
+def get_unique_phases(rlist):
+    uni_phases = []
+    for mixture in rlist.keys():
+        phases = mixture.split(' + ')
+        for ph in phases:
+            if ph not in ['LIQUID'] + uni_phases:
+                uni_phases.append(ph)
+    return uni_phases
+
+
+def get_cr_wt_percent_in_phase(result, phase_name):
+    """
+    Returns Cr wt% in a given phase at the final / lowest Scheil temperature.
+    TC-Python usually returns mass fraction, so we multiply by 100.
+    """
+
+    possible_quantity_names = [
+        "mass_fraction_of_component_in_a_solid_phase",
+        "mass_fraction_of_component_in_phase",
+        "mass_fraction_of_a_component_in_a_solid_phase",
+        "mass_fraction_of_a_component_in_phase"
+    ]
+
+    for qname in possible_quantity_names:
+        if hasattr(ScheilQuantity, qname):
+            try:
+                qfunc = getattr(ScheilQuantity, qname)
+                cr_data = result.get_values_of(
+                    qfunc("Cr", phase_name),
+                    ScheilQuantity.temperature()
+                )
+
+                cr_data = np.asarray(cr_data)
+                cr_fraction = cr_data[0, :]
+                temp = cr_data[1, :]
+
+                idx = np.argmin(temp)
+
+                return cr_fraction[idx] * 100.0
+
+            except Exception:
+                pass
+
+    return np.nan
+
+
+system = (
+    SetUp()
+    .select_database_and_elements(database, [base] + elem)
+    .get_system()
+)
+
+calculator = (
+    system
+    .with_scheil_calculation()
+    .with_options(ScheilOptions().set_temperature_step(t_step))
+    .with_options(ScheilOptions().terminate_on_fraction_of_liquid_phase(min_liq))
+    .enable_global_minimization()
+    .set_start_temperature(t_start)
+    .set_composition_unit(CompositionUnit.MASS_PERCENT)
+)
+
+start_time = time.time()
+
+df_ph = df_combined_chemistries[elem].copy()
+all_phases = []
+
+
+def phase_obtain(row_entire):
+    index = row_entire[0]
+    row = row_entire[1]
+
+    for el in elem:
+        calculator.set_composition(el, row[el])
+
+    result = calculator.calculate()
+
+    rlist = result.get_values_grouped_by_stable_phases_of(
+        ScheilQuantity.temperature(),
+        ScheilQuantity.volume_fraction_of_all_solid_phases()
+    )
+
+    phases = get_unique_phases(rlist)
+
+    for ph in phases:
+
+        phasefrac = result.get_values_of(
+            ScheilQuantity.volume_fraction_of_a_solid_phase(ph),
+            ScheilQuantity.temperature()
+        )
+
+        phasefrac = np.asarray(phasefrac)
+
+        f = phasefrac[0, :]
+        t = phasefrac[1, :]
+        idx = np.argmin(t)
+
+        phase_fraction_final = f[idx]
+
+        cr_col = f"{ph}_Cr_wt%"
+
+        if ph not in df_ph.columns:
+            df_ph[ph] = 0.0
+
+        if cr_col not in df_ph.columns:
+            df_ph[cr_col] = np.nan
+
+        df_ph.loc[index, ph] = phase_fraction_final
+        df_ph.loc[index, cr_col] = get_cr_wt_percent_in_phase(result, ph)
+
+        if ph not in all_phases:
+            all_phases.append(ph)
+
+
+for row_entire in df_combined_chemistries.iterrows():
+    phase_obtain(row_entire)
+
+# Reorder columns so each phase is followed by its Cr wt% column
+ordered_cols = elem.copy()
+
+for ph in all_phases:
+    ordered_cols.append(ph)
+    ordered_cols.append(f"{ph}_Cr_wt%")
+
+df_ph = df_ph[ordered_cols]
+
+end_time = time.time()
+print("Calculation time:", end_time - start_time)
+
+df_ph.to_csv('PhaseFractions_and_CrContent_Scheil_6000.csv', index=False)
+
+stop_api_server()
