@@ -1,11 +1,10 @@
-## Import required packages
 import numpy as np
 import pandas as pd
 import time
 from tc_python import *
 
 # =========================
-# Read input chemistry file
+# Read input file
 # =========================
 
 df_inp = pd.read_csv('./6000.csv')
@@ -18,13 +17,14 @@ input_frame = df_inp[inputs_list]
 input_frame_nonan = input_frame.dropna(axis=0)
 input_values = input_frame_nonan.values
 
-# Calculate Al balance
+# Al balance
 al_content = 100 - np.sum(input_values, axis=1)
 al_content = np.reshape(al_content, (len(al_content), -1))
 
 all_chemistries = np.concatenate((al_content, input_values), axis=1)
 
 all_inputs_list = ['Al', 'Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
+
 df_combined_chemistries = pd.DataFrame(
     all_chemistries,
     columns=all_inputs_list
@@ -39,9 +39,10 @@ elem = ['Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
 
 database = "TCAL10"
 
-t_start = 1000        # K
-t_step = 1.0          # K
-min_liq = 0.005       # terminate when liquid fraction is below this value
+# Use higher temperature, especially for high-Cr alloys
+t_start = 1400       # K
+t_step = 1.0         # K
+min_liq = 0.005      # stop at 0.5% liquid
 
 start_api_server()
 
@@ -63,41 +64,100 @@ def get_unique_phases(rlist):
     return uni_phases
 
 
+def print_available_scheil_quantities():
+    print("\nAvailable ScheilQuantity functions containing 'fraction', 'component', or 'phase':")
+
+    for name in dir(ScheilQuantity):
+        lname = name.lower()
+        if "fraction" in lname or "component" in lname or "phase" in lname:
+            print(name)
+
+
+def extract_final_value(data):
+    """
+    Expects TC-Python result as two arrays:
+    value array and temperature array.
+    Returns value at lowest temperature.
+    """
+
+    data = np.asarray(data)
+
+    values = data[0, :]
+    temps = data[1, :]
+
+    idx = np.argmin(temps)
+
+    return values[idx]
+
+
 def get_cr_wt_percent_in_phase(result, phase_name):
     """
-    Returns Cr content in a phase at the final Scheil temperature.
+    Returns Cr wt% in a given solid phase at the final Scheil temperature.
 
-    Output unit:
-    wt% Cr in that phase
-
-    Note:
-    TC-Python usually returns mass fraction, so we multiply by 100.
+    The function tries several possible TC-Python syntax versions.
     """
 
-    try:
-        cr_data = result.get_values_of(
-            ScheilQuantity.mass_fraction_of_component_in_phase("Cr", phase_name),
-            ScheilQuantity.temperature()
-        )
+    possible_element_names = ["Cr", "CR"]
 
-        cr_data = np.asarray(cr_data)
+    possible_quantity_names = [
+        "mass_fraction_of_component_in_phase",
+        "mass_fraction_of_component_in_a_phase",
+        "mass_fraction_of_component_in_solid_phase",
+        "mass_fraction_of_component_in_a_solid_phase",
+        "mass_fraction_of_a_component_in_phase",
+        "mass_fraction_of_a_component_in_a_phase",
+        "mass_fraction_of_a_component_in_solid_phase",
+        "mass_fraction_of_a_component_in_a_solid_phase",
+        "weight_fraction_of_component_in_phase",
+        "weight_fraction_of_component_in_a_phase",
+        "weight_fraction_of_component_in_solid_phase",
+        "weight_fraction_of_component_in_a_solid_phase"
+    ]
 
-        cr_fraction = cr_data[0, :]
-        temp = cr_data[1, :]
+    for qname in possible_quantity_names:
 
-        idx = np.argmin(temp)
+        if not hasattr(ScheilQuantity, qname):
+            continue
 
-        cr_wt_percent = cr_fraction[idx] * 100.0
+        qfunc = getattr(ScheilQuantity, qname)
 
-        return cr_wt_percent
+        for el in possible_element_names:
 
-    except Exception as e:
-        print(f"Could not calculate Cr wt% in phase {phase_name}: {e}")
-        return np.nan
+            # Try order: element, phase
+            try:
+                cr_data = result.get_values_of(
+                    qfunc(el, phase_name),
+                    ScheilQuantity.temperature()
+                )
+
+                cr_fraction = extract_final_value(cr_data)
+
+                # Usually TC-Python returns mass fraction, so convert to wt%
+                return cr_fraction * 100.0
+
+            except Exception:
+                pass
+
+            # Try order: phase, element
+            try:
+                cr_data = result.get_values_of(
+                    qfunc(phase_name, el),
+                    ScheilQuantity.temperature()
+                )
+
+                cr_fraction = extract_final_value(cr_data)
+
+                return cr_fraction * 100.0
+
+            except Exception:
+                pass
+
+    print(f"\nWARNING: Could not extract Cr content for phase: {phase_name}")
+    return np.nan
 
 
 # =========================
-# Thermo-Calc system setup
+# Thermo-Calc setup
 # =========================
 
 system = (
@@ -116,19 +176,20 @@ calculator = (
     .set_composition_unit(CompositionUnit.MASS_PERCENT)
 )
 
-
 # =========================
 # Output dataframe
 # =========================
 
 df_ph = df_combined_chemistries[elem].copy()
+
 all_phases = []
+failed_alloys = []
 
 start_time = time.time()
 
 
 # =========================
-# Main calculation function
+# Main calculation
 # =========================
 
 def phase_obtain(row_entire):
@@ -136,54 +197,43 @@ def phase_obtain(row_entire):
     index = row_entire[0]
     row = row_entire[1]
 
-    print(f"\nRunning alloy index: {index}")
+    print("\n======================================")
+    print(f"Running alloy index: {index}")
+    print("Composition:")
+    print(row)
+    print("======================================")
 
-    # Set composition
     for el in elem:
         calculator.set_composition(el, row[el])
 
-    # Run Scheil calculation
-    result = calculator.calculate()
+    try:
+        result = calculator.calculate()
 
-    # Get stable phase groups
-    rlist = result.get_values_grouped_by_stable_phases_of(
-        ScheilQuantity.temperature(),
-        ScheilQuantity.volume_fraction_of_all_solid_phases()
-    )
+    except Exception as e:
+        print(f"\nERROR: Scheil calculation failed for alloy index {index}")
+        print(e)
+        failed_alloys.append(index)
+        return
 
-    phases = get_unique_phases(rlist)
+    try:
+        rlist = result.get_values_grouped_by_stable_phases_of(
+            ScheilQuantity.temperature(),
+            ScheilQuantity.volume_fraction_of_all_solid_phases()
+        )
 
-    print("Phases found:", phases)
+        phases = get_unique_phases(rlist)
 
-    # Loop over each phase
+    except Exception as e:
+        print(f"\nERROR: Could not get phase list for alloy index {index}")
+        print(e)
+        failed_alloys.append(index)
+        return
+
+    print("Phases found:")
+    print(phases)
+
     for ph in phases:
 
-        # Get volume fraction of this phase vs temperature
-        phasefrac = result.get_values_of(
-            ScheilQuantity.volume_fraction_of_a_solid_phase(ph),
-            ScheilQuantity.temperature()
-        )
-
-        phasefrac = np.asarray(phasefrac)
-
-        f = phasefrac[0, :]
-        t = phasefrac[1, :]
-
-        # Final Scheil temperature = lowest temperature
-        idx = np.argmin(t)
-
-        phase_volume_fraction = f[idx]
-
-        # Get Cr wt% inside this phase
-        cr_wt_percent = get_cr_wt_percent_in_phase(result, ph)
-
-        print(
-            f"Phase: {ph}, "
-            f"Volume fraction: {phase_volume_fraction}, "
-            f"Cr wt%: {cr_wt_percent}"
-        )
-
-        # Create columns
         phase_col = ph
         cr_col = f"{ph}_Cr_wt%"
 
@@ -193,16 +243,36 @@ def phase_obtain(row_entire):
         if cr_col not in df_ph.columns:
             df_ph[cr_col] = np.nan
 
-        # Store values
+        try:
+            phasefrac = result.get_values_of(
+                ScheilQuantity.volume_fraction_of_a_solid_phase(ph),
+                ScheilQuantity.temperature()
+            )
+
+            phase_volume_fraction = extract_final_value(phasefrac)
+
+        except Exception as e:
+            print(f"Could not extract volume fraction for phase {ph}")
+            print(e)
+            phase_volume_fraction = np.nan
+
+        cr_wt_percent = get_cr_wt_percent_in_phase(result, ph)
+
         df_ph.loc[index, phase_col] = phase_volume_fraction
         df_ph.loc[index, cr_col] = cr_wt_percent
+
+        print(
+            f"Phase: {ph} | "
+            f"Volume fraction: {phase_volume_fraction} | "
+            f"Cr wt%: {cr_wt_percent}"
+        )
 
         if ph not in all_phases:
             all_phases.append(ph)
 
 
 # =========================
-# Run all compositions
+# Run calculations
 # =========================
 
 for row_entire in df_combined_chemistries.iterrows():
@@ -234,5 +304,20 @@ end_time = time.time()
 print("\nCalculation finished.")
 print("Calculation time:", end_time - start_time, "seconds")
 print("Output file:", output_file)
+
+if len(failed_alloys) > 0:
+    print("\nFailed alloy indices:")
+    print(failed_alloys)
+
+# Print available quantity names if Cr columns are still empty
+cr_columns = [col for col in df_ph.columns if "_Cr_wt%" in col]
+
+if len(cr_columns) > 0:
+    all_cr_empty = df_ph[cr_columns].isna().all().all()
+
+    if all_cr_empty:
+        print("\nAll Cr columns are empty.")
+        print("This means your TC-Python version uses a different quantity name.")
+        print_available_scheil_quantities()
 
 stop_api_server()
