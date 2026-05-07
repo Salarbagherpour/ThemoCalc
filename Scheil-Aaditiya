@@ -1,0 +1,133 @@
+## Import required packages
+import numpy as np  # Deal with arrays and matrices
+import pandas as pd  # Deal with input data from files
+import time
+from tc_python import *  # Thermocalc scripting modules. tc-python stands for ThermoCalc Python
+import os
+
+# Read input file containing chemistry information
+df_inp = pd.read_csv('./6000.csv')
+# Print out column headers - Use this to identify names of column headers corresponding
+# to chemistries since other headers may also be present on processing parameters
+print(list(df_inp.columns.values))
+
+# Include the identified column headers in the list below
+inputs_list = ['Si', 'Fe', 'Cu', 'Mn', 'Mg','Cr']
+# Filter input dataframe to remove NaN values - these are rows which are not really indexed so
+# they don't contribute sensible input data
+input_frame = df_inp[inputs_list]
+input_frame_nonan = input_frame.dropna(axis=0)
+input_values = input_frame_nonan.values
+
+# Aluminum solid solution content
+al_content = 100 - np.sum(input_values, axis=1)
+al_content = np.reshape(al_content, (len(al_content), -1))
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+all_inputs_list = ['Al', 'Si', 'Fe', 'Cu', 'Mn', 'Mg','Cr']
+df_combined_chemistries = pd.DataFrame(all_chemistries, columns=all_inputs_list)
+# Write .csv file with just chemistry data
+flag_write_chemistries = False
+if flag_write_chemistries:
+    df_combined_chemistries.to_csv('AllChemistries.csv', index=False)
+
+# print(len(input_frame_nonan))
+
+# Define some variables for use with TC-Python
+base = 'Al'
+elem = ['Si', 'Fe', 'Cu', 'Mn', 'Mg','Cr']  # , 'Zr','Sn','V','Pb']
+# TC settings
+database = "TCAL10"
+primary_solid_phase = "FCC_A1"
+liquid_phase = "LIQUID"
+t_start = 1000  # in K, starting temperature
+t_step = 1.0  # in K, use smaller temperature steps for more accurate results at expense of computation time
+min_liq = 0.005  # minimum LIQUID phase fraction
+
+start_api_server()
+
+
+# Helper function
+def get_unique_phases(rlist):
+    uni_phases = []
+    for mixture in rlist.keys():
+        phases = mixture.split(' + ')
+        for ph in phases:
+            if ph not in ['LIQUID'] + uni_phases:
+                uni_phases.append(ph)
+
+    return uni_phases
+
+
+# Thermocalc setup
+# system = (SetUp().select_database_and_elements(database, [base] + elem).
+#          get_system_for_scheil_calculations())
+
+system = (SetUp().select_database_and_elements(database, [base] + elem).get_system())
+
+calculator = (system.
+              with_scheil_calculation().
+              with_options(ScheilOptions().set_temperature_step(t_step)).
+              with_options(ScheilOptions().terminate_on_fraction_of_liquid_phase(min_liq)).
+              enable_global_minimization().
+              set_start_temperature(t_start).
+              set_composition_unit(CompositionUnit.MASS_PERCENT))
+
+tt = []
+start_time = time.time()
+all_phases = []
+df_ph = df_combined_chemistries[elem].copy()
+num_entries = None  # 1 # set to None to go over all entries
+
+
+def phase_obtain(row_entire):
+    index = row_entire[0]
+    row = row_entire[1]
+    for el in elem:
+        calculator.set_composition(el, row[el])
+
+    # Run the TC calculation
+    result = calculator.calculate()
+
+    # Get a list of phases
+    rlist = result.get_values_grouped_by_stable_phases_of(ScheilQuantity.temperature(),
+                                                          ScheilQuantity.volume_fraction_of_all_solid_phases())
+    phases = get_unique_phases(rlist)
+
+    # Loop over phases
+    for ph in phases:
+
+        # Get fractions of each phase at different T
+        phasefrac = result.get_values_of(ScheilQuantity.volume_fraction_of_a_solid_phase(ph),
+                                         ScheilQuantity.temperature())
+
+        phasefrac = np.asarray(phasefrac)
+
+        # Create a dataframe column for new phase
+        if ph not in list(df_ph.columns):
+            df_ph[ph] = 0.
+
+        # Find mole fraction at lowest T
+        f = phasefrac[0, :]
+        t = phasefrac[1, :]
+        idx = np.argmin(t)
+
+        # Add value to dataframe
+        df_ph.loc[index, ph] = f[idx]
+
+        # Add new phase to list of all phases
+        if ph not in all_phases:
+            all_phases.append(ph)
+
+
+# loop over compositions to compute phase fractions and append to array
+for row_entire in df_combined_chemistries.iterrows():
+    phase_obtain(row_entire)
+
+end_time = time.time()
+dt = end_time - start_time
+tt.append(float(dt))
+print(dt)
+
+# Write phase fractions to .csv file
+df_ph.to_csv('PhaseFractions_Scheil_6000.csv')
+stop_api_server()
