@@ -9,7 +9,7 @@ from tc_python import *
 # =========================
 
 input_file = "./6000.csv"
-output_file = "PhaseWeightPercent_and_CrContent_Scheil_6000.csv"
+output_file = "PhaseWtPercent_CrDistribution_Scheil_6000.csv"
 
 database = "TCAL10"
 
@@ -48,46 +48,115 @@ def get_unique_solid_phases(grouped_result):
     return unique_phases
 
 
-def get_phase_mass_fraction(result, phase_name):
+def get_scheil_value(result, quantity, console_quantity=None):
+    """
+    Gets final value at lowest temperature.
+    If the ScheilQuantity form fails, tries Console Mode syntax such as:
+        NN(PHASE,Cr)
+        BL
+    """
     try:
         data = result.get_values_of(
-            ScheilQuantity.mass_fraction_of_a_solid_phase(phase_name),
+            quantity,
             ScheilQuantity.temperature()
         )
         return extract_final_value(data)
 
+    except Exception as first_error:
+        if console_quantity is None:
+            raise first_error
+
+        data = result.get_values_of(
+            console_quantity,
+            ScheilQuantity.temperature()
+        )
+        return extract_final_value(data)
+
+
+def get_solid_phase_wt_percent(result, phase_name):
+    """
+    Returns phase amount in wt% of the whole alloy.
+    """
+    try:
+        phase_wf = get_scheil_value(
+            result,
+            ScheilQuantity.mass_fraction_of_a_solid_phase(phase_name),
+            f"BS({phase_name})"
+        )
+        return phase_wf * 100.0
+
     except Exception as e:
-        print(f"Could not get mass fraction for phase {phase_name}: {e}")
+        print(f"Could not get phase wt% for {phase_name}: {e}")
         return np.nan
 
 
-def get_phase_cr_weight_fraction(result, phase_name):
+def get_liquid_wt_percent(result, solid_phase_wt_percents):
+    """
+    Returns liquid amount in wt% of the whole alloy.
+    Prefer direct Thermo-Calc liquid fraction.
+    If unavailable, estimate from:
+        liquid = 100 - sum(solid phases)
+    """
     try:
-        data = result.get_values_of(
-            ScheilQuantity.composition_of_phase_as_weight_fraction(
+        liquid_wf = get_scheil_value(
+            result,
+            ScheilQuantity.mass_fraction_of_liquid_phase(),
+            "BL"
+        )
+        return liquid_wf * 100.0
+
+    except Exception:
+        solid_sum = np.nansum(solid_phase_wt_percents)
+        return max(0.0, 100.0 - solid_sum)
+
+
+def get_cr_distribution_fraction(result, phase_name):
+    """
+    Returns the fraction of total Cr inventory located in this phase.
+
+    Example:
+        0.30 means 30% of all Cr in the alloy is in this phase.
+
+    This is better for mass balance than using only final W(phase,Cr).
+    """
+    try:
+        cr_dist = get_scheil_value(
+            result,
+            ScheilQuantity.distribution_of_component_of_phase(
                 phase_name,
                 "Cr"
             ),
-            ScheilQuantity.temperature()
+            f"NN({phase_name},Cr)"
         )
-        return extract_final_value(data)
+        return cr_dist
 
     except Exception as e:
-        print(f"Could not get Cr weight fraction in phase {phase_name}: {e}")
+        print(f"Could not get Cr distribution for {phase_name}: {e}")
         return np.nan
 
 
-def get_liquid_mass_fraction(result, solid_phase_fractions):
-    try:
-        data = result.get_values_of(
-            ScheilQuantity.mass_fraction_of_liquid_phase(),
-            ScheilQuantity.temperature()
-        )
-        return extract_final_value(data)
+def calculate_average_cr_wt_percent_in_phase(
+    input_cr_wt_percent,
+    phase_wt_percent,
+    cr_distribution_fraction
+):
+    """
+    Cr in phase, averaged over the total amount of that phase:
 
-    except Exception:
-        solid_sum = np.nansum(solid_phase_fractions)
-        return max(0.0, 1.0 - solid_sum)
+        Cr_from_phase = input_Cr * Cr_distribution
+        average_Cr_in_phase = 100 * Cr_from_phase / phase_wt_percent
+
+    All wt% units.
+    """
+    if (
+        pd.isna(phase_wt_percent)
+        or pd.isna(cr_distribution_fraction)
+        or phase_wt_percent <= 0.0
+    ):
+        return np.nan
+
+    cr_from_phase_wt_percent = input_cr_wt_percent * cr_distribution_fraction
+    return 100.0 * cr_from_phase_wt_percent / phase_wt_percent
 
 
 # =========================
@@ -200,33 +269,67 @@ try:
 
         print("Solid phases found:", solid_phases)
 
-        solid_phase_fractions = []
+        input_cr_wt_percent = row["Cr"]
+
+        solid_phase_wt_percents = []
+        solid_cr_total_wt_percent = 0.0
+        cr_distribution_sum = 0.0
+
+        # =========================
+        # Solid phases
+        # =========================
 
         for ph in solid_phases:
 
             phase_pct_col = f"{ph}_wt_percent"
-            cr_pct_col = f"{ph}_Cr_wt_percent"
+            cr_dist_col = f"{ph}_Cr_distribution_percent"
+            cr_contrib_col = f"{ph}_Cr_contribution_wt_percent"
+            cr_avg_col = f"{ph}_Average_Cr_wt_percent"
 
             if phase_pct_col not in df_ph.columns:
                 df_ph[phase_pct_col] = 0.0
 
-            if cr_pct_col not in df_ph.columns:
-                df_ph[cr_pct_col] = np.nan
+            if cr_dist_col not in df_ph.columns:
+                df_ph[cr_dist_col] = np.nan
 
-            phase_wf = get_phase_mass_fraction(result, ph)
-            cr_wf = get_phase_cr_weight_fraction(result, ph)
+            if cr_contrib_col not in df_ph.columns:
+                df_ph[cr_contrib_col] = np.nan
 
-            phase_wt_percent = phase_wf * 100.0
-            cr_wt_percent = cr_wf * 100.0
+            if cr_avg_col not in df_ph.columns:
+                df_ph[cr_avg_col] = np.nan
+
+            phase_wt_percent = get_solid_phase_wt_percent(result, ph)
+            cr_distribution_fraction = get_cr_distribution_fraction(result, ph)
+
+            cr_distribution_percent = cr_distribution_fraction * 100.0
+            cr_contribution_wt_percent = (
+                input_cr_wt_percent * cr_distribution_fraction
+            )
+
+            average_cr_wt_percent = calculate_average_cr_wt_percent_in_phase(
+                input_cr_wt_percent,
+                phase_wt_percent,
+                cr_distribution_fraction
+            )
 
             df_ph.loc[index, phase_pct_col] = phase_wt_percent
-            df_ph.loc[index, cr_pct_col] = cr_wt_percent
+            df_ph.loc[index, cr_dist_col] = cr_distribution_percent
+            df_ph.loc[index, cr_contrib_col] = cr_contribution_wt_percent
+            df_ph.loc[index, cr_avg_col] = average_cr_wt_percent
 
-            solid_phase_fractions.append(phase_wf)
+            solid_phase_wt_percents.append(phase_wt_percent)
+
+            if not pd.isna(cr_contribution_wt_percent):
+                solid_cr_total_wt_percent += cr_contribution_wt_percent
+
+            if not pd.isna(cr_distribution_fraction):
+                cr_distribution_sum += cr_distribution_fraction
 
             print(
                 f"{ph}: phase wt% = {phase_wt_percent}, "
-                f"Cr in phase wt% = {cr_wt_percent}"
+                f"Cr distribution = {cr_distribution_percent}%, "
+                f"Cr contribution = {cr_contribution_wt_percent} wt%, "
+                f"average Cr in phase = {average_cr_wt_percent} wt%"
             )
 
             if ph not in all_solid_phases:
@@ -236,45 +339,45 @@ try:
         # Remaining liquid
         # =========================
 
-        liquid_wf = get_liquid_mass_fraction(result, solid_phase_fractions)
-        liquid_cr_wf = get_phase_cr_weight_fraction(result, "LIQUID")
+        liquid_wt_percent = get_liquid_wt_percent(result, solid_phase_wt_percents)
+        liquid_cr_distribution_fraction = get_cr_distribution_fraction(result, "LIQUID")
 
-        liquid_wt_percent = liquid_wf * 100.0
-        liquid_cr_wt_percent = liquid_cr_wf * 100.0
+        liquid_cr_distribution_percent = liquid_cr_distribution_fraction * 100.0
+        liquid_cr_contribution_wt_percent = (
+            input_cr_wt_percent * liquid_cr_distribution_fraction
+        )
+
+        liquid_average_cr_wt_percent = calculate_average_cr_wt_percent_in_phase(
+            input_cr_wt_percent,
+            liquid_wt_percent,
+            liquid_cr_distribution_fraction
+        )
 
         df_ph.loc[index, "LIQUID_wt_percent"] = liquid_wt_percent
-        df_ph.loc[index, "LIQUID_Cr_wt_percent"] = liquid_cr_wt_percent
+        df_ph.loc[index, "LIQUID_Cr_distribution_percent"] = liquid_cr_distribution_percent
+        df_ph.loc[index, "LIQUID_Cr_contribution_wt_percent"] = liquid_cr_contribution_wt_percent
+        df_ph.loc[index, "LIQUID_Average_Cr_wt_percent"] = liquid_average_cr_wt_percent
+
+        liquid_cr_total_wt_percent = 0.0
+
+        if not pd.isna(liquid_cr_contribution_wt_percent):
+            liquid_cr_total_wt_percent = liquid_cr_contribution_wt_percent
+            cr_distribution_sum += liquid_cr_distribution_fraction
 
         print(
             f"LIQUID: wt% = {liquid_wt_percent}, "
-            f"Cr wt% = {liquid_cr_wt_percent}"
+            f"Cr distribution = {liquid_cr_distribution_percent}%, "
+            f"Cr contribution = {liquid_cr_contribution_wt_percent} wt%, "
+            f"average Cr in liquid = {liquid_average_cr_wt_percent} wt%"
         )
 
         # =========================
         # Cr mass balance
         # =========================
 
-        solid_cr_total_wt_percent = 0.0
-
-        for ph in solid_phases:
-            phase_wt_percent = df_ph.loc[index, f"{ph}_wt_percent"]
-            cr_wt_percent = df_ph.loc[index, f"{ph}_Cr_wt_percent"]
-
-            if not pd.isna(phase_wt_percent) and not pd.isna(cr_wt_percent):
-                solid_cr_total_wt_percent += (
-                    phase_wt_percent * cr_wt_percent / 100.0
-                )
-
-        liquid_cr_total_wt_percent = np.nan
-        total_cr_calc_wt_percent = solid_cr_total_wt_percent
-
-        if not pd.isna(liquid_wt_percent) and not pd.isna(liquid_cr_wt_percent):
-            liquid_cr_total_wt_percent = (
-                liquid_wt_percent * liquid_cr_wt_percent / 100.0
-            )
-            total_cr_calc_wt_percent += liquid_cr_total_wt_percent
-
-        input_cr_wt_percent = row["Cr"]
+        total_cr_calc_wt_percent = (
+            solid_cr_total_wt_percent + liquid_cr_total_wt_percent
+        )
 
         df_ph.loc[index, "Input_Cr_wt_percent"] = input_cr_wt_percent
         df_ph.loc[index, "Calculated_solid_Cr_wt_percent"] = solid_cr_total_wt_percent
@@ -283,12 +386,17 @@ try:
         df_ph.loc[index, "Cr_balance_error_wt_percent"] = (
             total_cr_calc_wt_percent - input_cr_wt_percent
         )
+        df_ph.loc[index, "Cr_distribution_sum_percent"] = cr_distribution_sum * 100.0
+        df_ph.loc[index, "Cr_distribution_error_percent"] = (
+            cr_distribution_sum * 100.0 - 100.0
+        )
 
         print(f"Input Cr wt%: {input_cr_wt_percent}")
         print(f"Calculated solid Cr wt%: {solid_cr_total_wt_percent}")
         print(f"Calculated liquid Cr wt%: {liquid_cr_total_wt_percent}")
         print(f"Calculated total Cr wt%: {total_cr_calc_wt_percent}")
         print(f"Cr balance error wt%: {total_cr_calc_wt_percent - input_cr_wt_percent}")
+        print(f"Cr distribution sum %: {cr_distribution_sum * 100.0}")
 
 finally:
     stop_api_server()
@@ -303,17 +411,23 @@ ordered_cols = elem.copy()
 for ph in all_solid_phases:
     ordered_cols.extend([
         f"{ph}_wt_percent",
-        f"{ph}_Cr_wt_percent",
+        f"{ph}_Average_Cr_wt_percent",
+        f"{ph}_Cr_contribution_wt_percent",
+        f"{ph}_Cr_distribution_percent",
     ])
 
 ordered_cols.extend([
     "LIQUID_wt_percent",
-    "LIQUID_Cr_wt_percent",
+    "LIQUID_Average_Cr_wt_percent",
+    "LIQUID_Cr_contribution_wt_percent",
+    "LIQUID_Cr_distribution_percent",
     "Input_Cr_wt_percent",
     "Calculated_solid_Cr_wt_percent",
     "Calculated_liquid_Cr_wt_percent",
     "Calculated_total_Cr_wt_percent",
     "Cr_balance_error_wt_percent",
+    "Cr_distribution_sum_percent",
+    "Cr_distribution_error_percent",
 ])
 
 ordered_cols = [col for col in ordered_cols if col in df_ph.columns]
