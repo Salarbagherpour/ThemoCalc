@@ -1,0 +1,384 @@
+import numpy as np
+import pandas as pd
+import time
+from tc_python import *
+
+
+# =========================
+# User settings
+# =========================
+
+input_file = "./6000.csv"
+output_file = "PhaseWeightFractions_and_CrContent_Scheil_6000.csv"
+
+database = "TCAL10"
+
+base = "Al"
+elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
+all_inputs_list = [base] + elem
+
+t_start = 1600      # K
+t_step = 1.0        # K
+min_liq = 0.005     # Stop when liquid mass fraction reaches this value
+
+
+# =========================
+# Helper functions
+# =========================
+
+def extract_final_value(data):
+    """
+    TC-Python get_values_of() usually returns:
+        [values, temperatures]
+    This returns the value at the lowest temperature reached.
+    """
+    values, temps = data
+    values = np.asarray(values)
+    temps = np.asarray(temps)
+
+    idx = np.argmin(temps)
+    return float(values[idx])
+
+
+def get_unique_solid_phases(grouped_result):
+    """
+    Extract unique solid phase names from:
+        result.get_values_grouped_by_stable_phases_of(...)
+    Excludes LIQUID.
+    """
+    unique_phases = []
+
+    for mixture in grouped_result.keys():
+        phases = mixture.split(" + ")
+
+        for ph in phases:
+            if ph != "LIQUID" and ph not in unique_phases:
+                unique_phases.append(ph)
+
+    return unique_phases
+
+
+def get_phase_mass_fraction(result, phase_name):
+    """
+    Returns mass fraction of one solid phase.
+    Example:
+        0.25 = 25 wt% of the whole alloy is this phase.
+    """
+    try:
+        data = result.get_values_of(
+            ScheilQuantity.mass_fraction_of_a_solid_phase(phase_name),
+            ScheilQuantity.temperature()
+        )
+        return extract_final_value(data)
+
+    except Exception as e:
+        print(f"Could not get mass fraction for phase {phase_name}: {e}")
+        return np.nan
+
+
+def get_phase_cr_weight_fraction(result, phase_name):
+    """
+    Returns Cr weight fraction inside a phase.
+    Example:
+        0.01 = 1 wt% Cr inside that phase.
+    """
+    try:
+        data = result.get_values_of(
+            ScheilQuantity.composition_of_phase_as_weight_fraction(
+                phase_name,
+                "Cr"
+            ),
+            ScheilQuantity.temperature()
+        )
+        return extract_final_value(data)
+
+    except Exception as e:
+        print(f"Could not get Cr weight fraction in phase {phase_name}: {e}")
+        return np.nan
+
+
+def get_liquid_mass_fraction(result, solid_phase_fractions):
+    """
+    Prefer direct Scheil liquid mass fraction if available.
+    If unavailable, estimate as:
+        liquid = 1 - sum(solid phase mass fractions)
+    """
+    try:
+        data = result.get_values_of(
+            ScheilQuantity.mass_fraction_of_liquid_phase(),
+            ScheilQuantity.temperature()
+        )
+        return extract_final_value(data)
+
+    except Exception:
+        solid_sum = np.nansum(solid_phase_fractions)
+        return max(0.0, 1.0 - solid_sum)
+
+
+# =========================
+# Read input file
+# =========================
+
+df_inp = pd.read_csv(input_file)
+
+print("Input columns:")
+print(list(df_inp.columns.values))
+
+missing_cols = [col for col in elem if col not in df_inp.columns]
+if missing_cols:
+    raise ValueError(f"Missing required input columns: {missing_cols}")
+
+input_frame = df_inp[elem]
+input_frame_nonan = input_frame.dropna(axis=0).copy()
+
+input_values = input_frame_nonan.values.astype(float)
+
+solute_sum = np.sum(input_values, axis=1)
+if np.any(solute_sum > 100.0):
+    bad_rows = input_frame_nonan.index[solute_sum > 100.0].tolist()
+    raise ValueError(
+        f"Some rows have solute sum greater than 100 wt%. Bad input rows: {bad_rows}"
+    )
+
+al_content = 100.0 - solute_sum
+al_content = np.reshape(al_content, (len(al_content), -1))
+
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+
+df_combined_chemistries = pd.DataFrame(
+    all_chemistries,
+    columns=all_inputs_list,
+    index=input_frame_nonan.index
+)
+
+print("\nPrepared compositions:")
+print(df_combined_chemistries.head())
+
+
+# =========================
+# Output dataframe
+# =========================
+
+df_ph = df_combined_chemistries[elem].copy()
+
+all_solid_phases = []
+failed_alloys = []
+
+start_time = time.time()
+
+
+# =========================
+# Run Thermo-Calc
+# =========================
+
+start_api_server()
+
+try:
+    system = (
+        SetUp()
+        .select_database_and_elements(database, all_inputs_list)
+        .get_system()
+    )
+
+    calculator = (
+        system
+        .with_scheil_calculation()
+        .with_options(ScheilOptions().set_temperature_step(t_step))
+        .with_options(ScheilOptions().terminate_on_fraction_of_liquid_phase(min_liq))
+        .enable_global_minimization()
+        .set_start_temperature(t_start)
+        .set_composition_unit(CompositionUnit.MASS_PERCENT)
+    )
+
+    for index, row in df_combined_chemistries.iterrows():
+
+        print("\n==============================")
+        print(f"Running alloy index: {index}")
+        print(row)
+        print("==============================")
+
+        for el in elem:
+            calculator.set_composition(el, row[el])
+
+        try:
+            result = calculator.calculate()
+
+        except Exception as e:
+            print(f"ERROR: Scheil calculation failed for alloy index {index}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        try:
+            grouped = result.get_values_grouped_by_stable_phases_of(
+                ScheilQuantity.temperature(),
+                ScheilQuantity.mass_fraction_of_all_solid_phases()
+            )
+
+            solid_phases = get_unique_solid_phases(grouped)
+
+        except Exception as e:
+            print(f"ERROR: Could not get phases for alloy index {index}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        print("Solid phases found:", solid_phases)
+
+        solid_phase_fractions = []
+
+        for ph in solid_phases:
+
+            phase_col = f"{ph}_wt_fraction"
+            phase_pct_col = f"{ph}_wt_percent"
+            cr_col = f"{ph}_Cr_wt_fraction"
+            cr_pct_col = f"{ph}_Cr_wt_percent"
+
+            if phase_col not in df_ph.columns:
+                df_ph[phase_col] = 0.0
+                df_ph[phase_pct_col] = 0.0
+
+            if cr_col not in df_ph.columns:
+                df_ph[cr_col] = np.nan
+                df_ph[cr_pct_col] = np.nan
+
+            phase_wf = get_phase_mass_fraction(result, ph)
+            cr_wf = get_phase_cr_weight_fraction(result, ph)
+
+            df_ph.loc[index, phase_col] = phase_wf
+            df_ph.loc[index, phase_pct_col] = phase_wf * 100.0
+
+            df_ph.loc[index, cr_col] = cr_wf
+            df_ph.loc[index, cr_pct_col] = cr_wf * 100.0
+
+            solid_phase_fractions.append(phase_wf)
+
+            print(
+                f"{ph}: phase mass fraction = {phase_wf}, "
+                f"phase wt% = {phase_wf * 100.0}, "
+                f"Cr in phase wt fraction = {cr_wf}, "
+                f"Cr in phase wt% = {cr_wf * 100.0}"
+            )
+
+            if ph not in all_solid_phases:
+                all_solid_phases.append(ph)
+
+        # =========================
+        # Remaining liquid
+        # =========================
+
+        liquid_wf = get_liquid_mass_fraction(result, solid_phase_fractions)
+        liquid_cr_wf = get_phase_cr_weight_fraction(result, "LIQUID")
+
+        df_ph.loc[index, "LIQUID_wt_fraction"] = liquid_wf
+        df_ph.loc[index, "LIQUID_wt_percent"] = liquid_wf * 100.0
+        df_ph.loc[index, "LIQUID_Cr_wt_fraction"] = liquid_cr_wf
+        df_ph.loc[index, "LIQUID_Cr_wt_percent"] = liquid_cr_wf * 100.0
+
+        print(
+            f"LIQUID: mass fraction = {liquid_wf}, "
+            f"wt% = {liquid_wf * 100.0}, "
+            f"Cr wt fraction = {liquid_cr_wf}, "
+            f"Cr wt% = {liquid_cr_wf * 100.0}"
+        )
+
+        # =========================
+        # Cr mass balance
+        # =========================
+
+        solid_cr_total_wf = 0.0
+
+        for ph in solid_phases:
+            phase_wf = df_ph.loc[index, f"{ph}_wt_fraction"]
+            cr_wf = df_ph.loc[index, f"{ph}_Cr_wt_fraction"]
+
+            if not pd.isna(phase_wf) and not pd.isna(cr_wf):
+                solid_cr_total_wf += phase_wf * cr_wf
+
+        liquid_cr_total_wf = np.nan
+        total_cr_calc_wf = solid_cr_total_wf
+
+        if not pd.isna(liquid_wf) and not pd.isna(liquid_cr_wf):
+            liquid_cr_total_wf = liquid_wf * liquid_cr_wf
+            total_cr_calc_wf += liquid_cr_total_wf
+
+        input_cr_wt_percent = row["Cr"]
+        input_cr_wf = input_cr_wt_percent / 100.0
+
+        df_ph.loc[index, "Input_Cr_wt_fraction"] = input_cr_wf
+        df_ph.loc[index, "Input_Cr_wt_percent"] = input_cr_wt_percent
+
+        df_ph.loc[index, "Calculated_solid_Cr_wt_fraction"] = solid_cr_total_wf
+        df_ph.loc[index, "Calculated_solid_Cr_wt_percent"] = solid_cr_total_wf * 100.0
+
+        df_ph.loc[index, "Calculated_liquid_Cr_wt_fraction"] = liquid_cr_total_wf
+        df_ph.loc[index, "Calculated_liquid_Cr_wt_percent"] = liquid_cr_total_wf * 100.0
+
+        df_ph.loc[index, "Calculated_total_Cr_wt_fraction"] = total_cr_calc_wf
+        df_ph.loc[index, "Calculated_total_Cr_wt_percent"] = total_cr_calc_wf * 100.0
+
+        df_ph.loc[index, "Cr_balance_error_wt_fraction"] = total_cr_calc_wf - input_cr_wf
+        df_ph.loc[index, "Cr_balance_error_wt_percent"] = (
+            total_cr_calc_wf * 100.0 - input_cr_wt_percent
+        )
+
+        print(f"Input Cr wt%: {input_cr_wt_percent}")
+        print(f"Calculated solid Cr wt%: {solid_cr_total_wf * 100.0}")
+        print(f"Calculated liquid Cr wt%: {liquid_cr_total_wf * 100.0}")
+        print(f"Calculated total Cr wt%: {total_cr_calc_wf * 100.0}")
+        print(f"Cr balance error wt%: {total_cr_calc_wf * 100.0 - input_cr_wt_percent}")
+
+finally:
+    stop_api_server()
+
+
+# =========================
+# Reorder columns
+# =========================
+
+ordered_cols = elem.copy()
+
+for ph in all_solid_phases:
+    ordered_cols.extend([
+        f"{ph}_wt_fraction",
+        f"{ph}_wt_percent",
+        f"{ph}_Cr_wt_fraction",
+        f"{ph}_Cr_wt_percent",
+    ])
+
+ordered_cols.extend([
+    "LIQUID_wt_fraction",
+    "LIQUID_wt_percent",
+    "LIQUID_Cr_wt_fraction",
+    "LIQUID_Cr_wt_percent",
+    "Input_Cr_wt_fraction",
+    "Input_Cr_wt_percent",
+    "Calculated_solid_Cr_wt_fraction",
+    "Calculated_solid_Cr_wt_percent",
+    "Calculated_liquid_Cr_wt_fraction",
+    "Calculated_liquid_Cr_wt_percent",
+    "Calculated_total_Cr_wt_fraction",
+    "Calculated_total_Cr_wt_percent",
+    "Cr_balance_error_wt_fraction",
+    "Cr_balance_error_wt_percent",
+])
+
+ordered_cols = [col for col in ordered_cols if col in df_ph.columns]
+df_ph = df_ph[ordered_cols]
+
+
+# =========================
+# Save output
+# =========================
+
+df_ph.to_csv(output_file, index=True, index_label="Input_index")
+
+end_time = time.time()
+
+print("\nCalculation finished.")
+print("Calculation time:", end_time - start_time, "seconds")
+print("Output file:", output_file)
+
+if failed_alloys:
+    print("Failed alloy indices:")
+    print(failed_alloys)
