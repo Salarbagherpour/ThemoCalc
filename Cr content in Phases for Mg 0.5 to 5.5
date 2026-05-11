@@ -1,0 +1,177 @@
+
+import numpy as np
+import matplotlib.pyplot as plt
+from tc_python import *
+
+"""
+Goal:
+- Plot Cr content (%) in AL15SI2M4 and FCC_A1 phases vs temperature (0°C to 700°C)
+- Compare two Mg contents: 1.5 wt% and 3.5 wt%
+- Other alloying elements constant
+- Cr = 0.1 wt%
+"""
+
+# -------------------------
+# Settings
+# -------------------------
+temperatures_C = np.arange(0, 701, 20)  # 0°C to 700°C, step 20
+temperatures_K = temperatures_C + 273.15
+
+# Alloying elements (fixed mass fractions)
+CR_content = 0.1  # wt%
+SI_mass_fraction = 0.0028
+FE_mass_fraction = 0.0053
+CU_mass_fraction = 0.0018
+MN_mass_fraction = 0.0075
+
+# Mg levels to evaluate (wt%)
+Mg_contents = [1.5, 3.5 ]
+
+# Phases to track
+phases_to_track = ["AL15SI2M4"]
+
+# Make curves continuous by interpolating across NaNs (set False to keep gaps)
+MAKE_CONTINUOUS = True
+
+# -------------------------
+# Helper: interpolate to make curves continuous
+# -------------------------
+def make_continuous(x, y):
+    """
+    Return a continuous series by linearly interpolating over NaNs.
+    Forward/back-fills ends with nearest valid values.
+    x: 1D array (temperatures, monotonic)
+    y: 1D array with possible NaNs
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(y)
+    if mask.sum() == 0:
+        # No valid data; return original (all NaNs)
+        return y.copy()
+    y_cont = y.copy()
+    # Interpolate internal NaNs if at least two valid points exist
+    if mask.sum() >= 2:
+        y_cont[~mask] = np.interp(x[~mask], x[mask], y[mask])
+    else:
+        # Only a single valid point: flat-fill everywhere
+        y_cont[~mask] = y[mask][0]
+    # Forward/back-fill ends
+    first = np.argmax(mask)  # first True index
+    last = len(mask) - 1 - np.argmax(mask[::-1])  # last True index
+    y_cont[:first] = y[first]
+    y_cont[last+1:] = y[last]
+    return y_cont
+
+# Storage: {phase: {mg: np.array(values_vs_T)}}, and presence masks
+results = {ph: {mg: [] for mg in Mg_contents} for ph in phases_to_track}
+presence_masks = {ph: {mg: [] for mg in Mg_contents} for ph in phases_to_track}
+
+# -------------------------
+# Equilibrium sweep
+# -------------------------
+with TCPython() as session:
+    # Use uppercase element symbols (TC-Python/TCAL8 are case-sensitive)
+    system = session.select_database_and_elements(
+        "TCAL10", ["AL", "SI", "FE", "CU", "MN", "MG", "CR"]
+    ).get_system()
+
+    for Mg_content in Mg_contents:
+        calculator = system.with_single_equilibrium_calculation()
+
+        # Fixed composition conditions
+        calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("SI"), SI_mass_fraction)
+        calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("FE"), FE_mass_fraction)
+        calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("CU"), CU_mass_fraction)
+        calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("MN"), MN_mass_fraction)
+        calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("MG"), Mg_content / 100.0)
+        calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("CR"), CR_content / 100.0)
+
+        for T in temperatures_K:
+            calculator.set_condition("T", T)
+            result = calculator.calculate()
+
+            for ph in phases_to_track:
+                try:
+                    # Phase presence via mass fraction (robust presence check)
+                    ph_mass_fraction = result.get_value_of(
+                        ThermodynamicQuantity.mass_fraction_of_a_phase(ph)
+                    )
+                    if ph_mass_fraction is None or ph_mass_fraction <= 1e-15:
+                        val = np.nan
+                        presence_masks[ph][Mg_content].append(False)
+                    else:
+                        # Composition of CR inside the phase (wt fraction -> wt%)
+                        val = result.get_value_of(
+                            ThermodynamicQuantity.composition_of_phase_as_weight_fraction(ph, "CR")
+                        ) * 100.0
+                        presence_masks[ph][Mg_content].append(True)
+                except Exception:
+                    val = np.nan
+                    presence_masks[ph][Mg_content].append(False)
+
+                results[ph][Mg_content].append(val)
+
+# Convert lists to numpy arrays
+for ph in phases_to_track:
+    for mg in Mg_contents:
+        results[ph][mg] = np.array(results[ph][mg], dtype=float)
+        presence_masks[ph][mg] = np.array(presence_masks[ph][mg], dtype=bool)
+
+# Optionally make series continuous
+if MAKE_CONTINUOUS:
+    results_cont = {ph: {mg: make_continuous(temperatures_C, results[ph][mg]) for mg in Mg_contents}
+                    for ph in phases_to_track}
+else:
+    # If not continuous, just use masked arrays to break lines where NaN
+    results_cont = results
+
+# -------------------------
+# Plot
+# -------------------------
+plt.figure(figsize=(9, 6))
+
+# Style: color by Mg level; linestyles by phase
+color_map = {1.5: "b", 3.5: "r"}
+style_map = {"AL15SI2M4": ("-", "o"), "FCC_A1": ("--", "s")}  # (linestyle, marker)
+
+for mg in Mg_contents:
+    for ph in phases_to_track:
+        linestyle, marker = style_map[ph]
+        color = color_map[mg]
+
+        # Plot continuous series
+        y = results_cont[ph][mg]
+        plt.plot(
+            temperatures_C, y,
+            color=color, linestyle=linestyle, linewidth=1.8,
+            label=f"{ph} (Mg = {mg:.1f} wt%)"
+        )
+
+        # Overlay sparse markers on actual valid points to show non-interpolated data
+        idx_valid = np.where(presence_masks[ph][mg])[0]
+        if idx_valid.size > 0:
+            step = max(1, idx_valid.size // 10)
+            plt.plot(
+                temperatures_C[idx_valid[::step]],
+                results[ph][mg][idx_valid[::step]],
+                linestyle="None", marker=marker, color=color
+            )
+
+plt.title("Cr Content in AL15SI2M4 & FCC_A1 vs Temperature (Cr = 0.1 wt%)")
+plt.xlabel("Temperature (°C)")
+plt.ylabel("Cr Content in Phase (%)")
+plt.grid(True, alpha=0.3)
+plt.legend(ncol=2)
+# Auto Y-limits with padding based on continuous series
+all_vals = np.concatenate([results_cont[ph][mg] for ph in phases_to_track for mg in Mg_contents])
+all_vals = all_vals[np.isfinite(all_vals)]
+if all_vals.size > 0:
+    ymin = max(0.0, float(all_vals.min()) - 0.05)
+    ymax = float(all_vals.max()) + 0.05
+    if np.isclose(ymin, ymax):  # avoid zero span
+        ymax = ymin + 0.1
+    plt.ylim(ymin, ymax)
+
+plt.tight_layout()
+plt.show()
