@@ -1,0 +1,558 @@
+import re
+import numpy as np
+import pandas as pd
+import time
+from tc_python import *
+
+
+# =========================
+# User settings
+# =========================
+
+input_file = "./6000.csv"
+output_file = "PhaseWeightVolumeFraction_CrRedistribution_NoAlCrFe_Scheil_6000.csv"
+
+database = "TCAL10"
+
+base = "Al"
+elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
+all_inputs_list = [base] + elem
+
+t_start = 1600
+t_step = 1.0
+min_liq = 0.005
+
+# Phases containing this text will be removed/suspended.
+excluded_phase_tokens = ["ALCRFE"]
+
+# If wildcard suspension does not work in your TC-Python version,
+# add exact phase names here after checking the printed phase names.
+excluded_phase_exact_names = []
+
+suspend_excluded_phases_in_calculation = True
+
+
+# =========================
+# Helper functions
+# =========================
+
+def normalize_phase_name(name):
+    return re.sub(r"[^A-Z0-9]", "", str(name).upper())
+
+
+def is_excluded_phase(phase_name):
+    normalized = normalize_phase_name(phase_name)
+    return any(token in normalized for token in excluded_phase_tokens)
+
+
+def extract_final_value(data):
+    values, temps = data
+    values = np.asarray(values)
+    temps = np.asarray(temps)
+
+    idx = np.argmin(temps)
+    return float(values[idx])
+
+
+def get_unique_solid_phases(grouped_result):
+    unique_phases = []
+
+    for mixture in grouped_result.keys():
+        phases = mixture.split(" + ")
+
+        for ph in phases:
+            if ph != "LIQUID" and ph not in unique_phases:
+                unique_phases.append(ph)
+
+    return unique_phases
+
+
+def get_scheil_value(result, quantity=None, console_quantity=None):
+    try:
+        if quantity is not None:
+            data = result.get_values_of(
+                quantity,
+                ScheilQuantity.temperature()
+            )
+            return extract_final_value(data)
+
+    except Exception as first_error:
+        if console_quantity is None:
+            raise first_error
+
+    if console_quantity is None:
+        raise ValueError("No valid Scheil quantity or console quantity was provided.")
+
+    data = result.get_values_of(
+        console_quantity,
+        ScheilQuantity.temperature()
+    )
+    return extract_final_value(data)
+
+
+def get_solid_phase_wt_fraction(result, phase_name):
+    try:
+        return get_scheil_value(
+            result,
+            ScheilQuantity.mass_fraction_of_a_solid_phase(phase_name),
+            f"BS({phase_name})"
+        )
+
+    except Exception as e:
+        print(f"Could not get weight fraction for {phase_name}: {e}")
+        return np.nan
+
+
+def get_solid_phase_vol_fraction(result, phase_name):
+    try:
+        quantity = None
+
+        try:
+            quantity = ScheilQuantity.volume_fraction_of_a_solid_phase(phase_name)
+        except Exception:
+            quantity = None
+
+        return get_scheil_value(
+            result,
+            quantity,
+            f"VS({phase_name})"
+        )
+
+    except Exception as e:
+        print(f"Could not get volume fraction for {phase_name}: {e}")
+        return np.nan
+
+
+def get_liquid_wt_fraction(result, solid_phase_wt_fractions):
+    try:
+        quantity = None
+
+        try:
+            quantity = ScheilQuantity.mass_fraction_of_liquid_phase()
+        except Exception:
+            quantity = None
+
+        return get_scheil_value(
+            result,
+            quantity,
+            "BL"
+        )
+
+    except Exception:
+        solid_sum = np.nansum(solid_phase_wt_fractions)
+        return max(0.0, 1.0 - solid_sum)
+
+
+def get_liquid_vol_fraction(result, solid_phase_vol_fractions):
+    try:
+        quantity = None
+
+        try:
+            quantity = ScheilQuantity.volume_fraction_of_liquid_phase()
+        except Exception:
+            quantity = None
+
+        return get_scheil_value(
+            result,
+            quantity,
+            "VL"
+        )
+
+    except Exception:
+        solid_sum = np.nansum(solid_phase_vol_fractions)
+        return max(0.0, 1.0 - solid_sum)
+
+
+def get_cr_distribution_fraction(result, phase_name):
+    try:
+        quantity = None
+
+        try:
+            quantity = ScheilQuantity.distribution_of_component_of_phase(
+                phase_name,
+                "Cr"
+            )
+        except Exception:
+            quantity = None
+
+        return get_scheil_value(
+            result,
+            quantity,
+            f"NN({phase_name},Cr)"
+        )
+
+    except Exception as e:
+        print(f"Could not get Cr distribution for {phase_name}: {e}")
+        return np.nan
+
+
+def calculate_average_cr_wt_percent_in_phase(
+    input_cr_wt_percent,
+    phase_wt_fraction,
+    cr_distribution_fraction
+):
+    if (
+        pd.isna(phase_wt_fraction)
+        or pd.isna(cr_distribution_fraction)
+        or phase_wt_fraction <= 0.0
+    ):
+        return np.nan
+
+    cr_contribution_wt_percent = input_cr_wt_percent * cr_distribution_fraction
+    return cr_contribution_wt_percent / phase_wt_fraction
+
+
+def suspend_excluded_phases(calculator):
+    if not suspend_excluded_phases_in_calculation:
+        return calculator
+
+    print("\nTrying to suspend excluded AlCrFe-type phases...")
+
+    for phase_name in excluded_phase_exact_names:
+        try:
+            calculator.set_phase_to_suspended(phase_name)
+            print(f"Suspended exact phase: {phase_name}")
+        except Exception as e:
+            print(f"Could not suspend exact phase {phase_name}: {e}")
+
+    for token in excluded_phase_tokens:
+        wildcard_phase = f"*{token}*"
+
+        try:
+            calculator.set_phase_to_suspended(wildcard_phase)
+            print(f"Suspended wildcard phase pattern: {wildcard_phase}")
+
+        except Exception as e:
+            print(f"Could not suspend wildcard phase pattern {wildcard_phase}: {e}")
+            print("If this matters, add exact phase names to excluded_phase_exact_names.")
+
+    return calculator
+
+
+# =========================
+# Read input file
+# =========================
+
+df_inp = pd.read_csv(input_file)
+
+print("Input columns:")
+print(list(df_inp.columns.values))
+
+missing_cols = [col for col in elem if col not in df_inp.columns]
+if missing_cols:
+    raise ValueError(f"Missing required input columns: {missing_cols}")
+
+input_frame = df_inp[elem]
+input_frame_nonan = input_frame.dropna(axis=0).copy()
+
+input_values = input_frame_nonan.values.astype(float)
+
+solute_sum = np.sum(input_values, axis=1)
+if np.any(solute_sum > 100.0):
+    bad_rows = input_frame_nonan.index[solute_sum > 100.0].tolist()
+    raise ValueError(
+        f"Some rows have solute sum greater than 100 wt%. Bad rows: {bad_rows}"
+    )
+
+al_content = 100.0 - solute_sum
+al_content = np.reshape(al_content, (len(al_content), -1))
+
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+
+df_combined_chemistries = pd.DataFrame(
+    all_chemistries,
+    columns=all_inputs_list,
+    index=input_frame_nonan.index
+)
+
+print("\nPrepared compositions:")
+print(df_combined_chemistries.head())
+
+
+# =========================
+# Output dataframe
+# =========================
+
+df_ph = df_combined_chemistries[elem].copy()
+
+all_solid_phases = []
+all_excluded_phases_seen = []
+failed_alloys = []
+
+start_time = time.time()
+
+
+# =========================
+# Run Thermo-Calc
+# =========================
+
+start_api_server()
+
+try:
+    system = (
+        SetUp()
+        .select_database_and_elements(database, all_inputs_list)
+        .get_system()
+    )
+
+    calculator = (
+        system
+        .with_scheil_calculation()
+        .with_options(ScheilOptions().set_temperature_step(t_step))
+        .with_options(ScheilOptions().terminate_on_fraction_of_liquid_phase(min_liq))
+        .enable_global_minimization()
+        .set_start_temperature(t_start)
+        .set_composition_unit(CompositionUnit.MASS_PERCENT)
+    )
+
+    calculator = suspend_excluded_phases(calculator)
+
+    for index, row in df_combined_chemistries.iterrows():
+
+        print("\n==============================")
+        print(f"Running alloy index: {index}")
+        print(row)
+        print("==============================")
+
+        for el in elem:
+            calculator.set_composition(el, row[el])
+
+        try:
+            result = calculator.calculate()
+
+        except Exception as e:
+            print(f"ERROR: Scheil calculation failed for alloy index {index}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        try:
+            grouped = result.get_values_grouped_by_stable_phases_of(
+                ScheilQuantity.temperature(),
+                ScheilQuantity.mass_fraction_of_all_solid_phases()
+            )
+
+            solid_phases_raw = get_unique_solid_phases(grouped)
+
+        except Exception as e:
+            print(f"ERROR: Could not get phases for alloy index {index}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        excluded_phases_this_alloy = [
+            ph for ph in solid_phases_raw if is_excluded_phase(ph)
+        ]
+
+        solid_phases = [
+            ph for ph in solid_phases_raw if not is_excluded_phase(ph)
+        ]
+
+        for ph in excluded_phases_this_alloy:
+            if ph not in all_excluded_phases_seen:
+                all_excluded_phases_seen.append(ph)
+
+        print("All solid phases found:", solid_phases_raw)
+        print("Excluded AlCrFe-type phases:", excluded_phases_this_alloy)
+        print("Reported solid phases:", solid_phases)
+
+        input_cr_wt_percent = row["Cr"]
+
+        solid_phase_wt_fractions = []
+        solid_phase_vol_fractions = []
+
+        solid_cr_total_wt_percent = 0.0
+        cr_distribution_sum_included = 0.0
+
+        # =========================
+        # Included solid phases
+        # =========================
+
+        for ph in solid_phases:
+
+            wt_frac_col = f"{ph}_wt_fraction"
+            vol_frac_col = f"{ph}_vol_fraction"
+            cr_dist_col = f"{ph}_Cr_distribution_percent"
+            cr_contrib_col = f"{ph}_Cr_contribution_wt_percent"
+            cr_avg_col = f"{ph}_Average_Cr_wt_percent"
+
+            for col, default in [
+                (wt_frac_col, 0.0),
+                (vol_frac_col, 0.0),
+                (cr_dist_col, np.nan),
+                (cr_contrib_col, np.nan),
+                (cr_avg_col, np.nan),
+            ]:
+                if col not in df_ph.columns:
+                    df_ph[col] = default
+
+            phase_wt_fraction = get_solid_phase_wt_fraction(result, ph)
+            phase_vol_fraction = get_solid_phase_vol_fraction(result, ph)
+            cr_distribution_fraction = get_cr_distribution_fraction(result, ph)
+
+            cr_distribution_percent = cr_distribution_fraction * 100.0
+            cr_contribution_wt_percent = (
+                input_cr_wt_percent * cr_distribution_fraction
+            )
+
+            average_cr_wt_percent = calculate_average_cr_wt_percent_in_phase(
+                input_cr_wt_percent,
+                phase_wt_fraction,
+                cr_distribution_fraction
+            )
+
+            df_ph.loc[index, wt_frac_col] = phase_wt_fraction
+            df_ph.loc[index, vol_frac_col] = phase_vol_fraction
+            df_ph.loc[index, cr_dist_col] = cr_distribution_percent
+            df_ph.loc[index, cr_contrib_col] = cr_contribution_wt_percent
+            df_ph.loc[index, cr_avg_col] = average_cr_wt_percent
+
+            solid_phase_wt_fractions.append(phase_wt_fraction)
+            solid_phase_vol_fractions.append(phase_vol_fraction)
+
+            if not pd.isna(cr_contribution_wt_percent):
+                solid_cr_total_wt_percent += cr_contribution_wt_percent
+
+            if not pd.isna(cr_distribution_fraction):
+                cr_distribution_sum_included += cr_distribution_fraction
+
+            print(
+                f"{ph}: wt fraction = {phase_wt_fraction}, "
+                f"vol fraction = {phase_vol_fraction}, "
+                f"Cr distribution = {cr_distribution_percent}%, "
+                f"Cr contribution = {cr_contribution_wt_percent} wt%, "
+                f"average Cr = {average_cr_wt_percent} wt%"
+            )
+
+            if ph not in all_solid_phases:
+                all_solid_phases.append(ph)
+
+        # =========================
+        # Remaining liquid
+        # =========================
+
+        liquid_wt_fraction = get_liquid_wt_fraction(result, solid_phase_wt_fractions)
+        liquid_vol_fraction = get_liquid_vol_fraction(result, solid_phase_vol_fractions)
+        liquid_cr_distribution_fraction = get_cr_distribution_fraction(result, "LIQUID")
+
+        liquid_cr_distribution_percent = liquid_cr_distribution_fraction * 100.0
+        liquid_cr_contribution_wt_percent = (
+            input_cr_wt_percent * liquid_cr_distribution_fraction
+        )
+
+        liquid_average_cr_wt_percent = calculate_average_cr_wt_percent_in_phase(
+            input_cr_wt_percent,
+            liquid_wt_fraction,
+            liquid_cr_distribution_fraction
+        )
+
+        df_ph.loc[index, "LIQUID_wt_fraction"] = liquid_wt_fraction
+        df_ph.loc[index, "LIQUID_vol_fraction"] = liquid_vol_fraction
+        df_ph.loc[index, "LIQUID_Cr_distribution_percent"] = liquid_cr_distribution_percent
+        df_ph.loc[index, "LIQUID_Cr_contribution_wt_percent"] = liquid_cr_contribution_wt_percent
+        df_ph.loc[index, "LIQUID_Average_Cr_wt_percent"] = liquid_average_cr_wt_percent
+
+        liquid_cr_total_wt_percent = 0.0
+
+        if not pd.isna(liquid_cr_contribution_wt_percent):
+            liquid_cr_total_wt_percent = liquid_cr_contribution_wt_percent
+            cr_distribution_sum_included += liquid_cr_distribution_fraction
+
+        print(
+            f"LIQUID: wt fraction = {liquid_wt_fraction}, "
+            f"vol fraction = {liquid_vol_fraction}, "
+            f"Cr distribution = {liquid_cr_distribution_percent}%, "
+            f"Cr contribution = {liquid_cr_contribution_wt_percent} wt%, "
+            f"average Cr = {liquid_average_cr_wt_percent} wt%"
+        )
+
+        # =========================
+        # Cr balance for included phases only
+        # =========================
+
+        total_cr_calc_wt_percent = (
+            solid_cr_total_wt_percent + liquid_cr_total_wt_percent
+        )
+
+        df_ph.loc[index, "Input_Cr_wt_percent"] = input_cr_wt_percent
+        df_ph.loc[index, "Included_solid_Cr_wt_percent"] = solid_cr_total_wt_percent
+        df_ph.loc[index, "Included_liquid_Cr_wt_percent"] = liquid_cr_total_wt_percent
+        df_ph.loc[index, "Included_total_Cr_wt_percent"] = total_cr_calc_wt_percent
+        df_ph.loc[index, "Included_Cr_balance_error_wt_percent"] = (
+            total_cr_calc_wt_percent - input_cr_wt_percent
+        )
+        df_ph.loc[index, "Included_Cr_distribution_sum_percent"] = (
+            cr_distribution_sum_included * 100.0
+        )
+        df_ph.loc[index, "Cr_not_included_distribution_percent"] = (
+            100.0 - cr_distribution_sum_included * 100.0
+        )
+        df_ph.loc[index, "Excluded_AlCrFe_phases_seen"] = "; ".join(
+            excluded_phases_this_alloy
+        )
+
+        print(f"Input Cr wt%: {input_cr_wt_percent}")
+        print(f"Included solid Cr wt%: {solid_cr_total_wt_percent}")
+        print(f"Included liquid Cr wt%: {liquid_cr_total_wt_percent}")
+        print(f"Included total Cr wt%: {total_cr_calc_wt_percent}")
+        print(f"Included Cr balance error wt%: {total_cr_calc_wt_percent - input_cr_wt_percent}")
+        print(f"Included Cr distribution sum %: {cr_distribution_sum_included * 100.0}")
+
+finally:
+    stop_api_server()
+
+
+# =========================
+# Reorder columns
+# =========================
+
+ordered_cols = elem.copy()
+
+for ph in all_solid_phases:
+    ordered_cols.extend([
+        f"{ph}_wt_fraction",
+        f"{ph}_vol_fraction",
+        f"{ph}_Average_Cr_wt_percent",
+        f"{ph}_Cr_contribution_wt_percent",
+        f"{ph}_Cr_distribution_percent",
+    ])
+
+ordered_cols.extend([
+    "LIQUID_wt_fraction",
+    "LIQUID_vol_fraction",
+    "LIQUID_Average_Cr_wt_percent",
+    "LIQUID_Cr_contribution_wt_percent",
+    "LIQUID_Cr_distribution_percent",
+    "Input_Cr_wt_percent",
+    "Included_solid_Cr_wt_percent",
+    "Included_liquid_Cr_wt_percent",
+    "Included_total_Cr_wt_percent",
+    "Included_Cr_balance_error_wt_percent",
+    "Included_Cr_distribution_sum_percent",
+    "Cr_not_included_distribution_percent",
+    "Excluded_AlCrFe_phases_seen",
+])
+
+ordered_cols = [col for col in ordered_cols if col in df_ph.columns]
+df_ph = df_ph[ordered_cols]
+
+
+# =========================
+# Save output
+# =========================
+
+df_ph.to_csv(output_file, index=True, index_label="Input_index")
+
+end_time = time.time()
+
+print("\nCalculation finished.")
+print("Calculation time:", end_time - start_time, "seconds")
+print("Output file:", output_file)
+
+if all_excluded_phases_seen:
+    print("\nExcluded AlCrFe-type phases seen:")
+    print(all_excluded_phases_seen)
+
+if failed_alloys:
+    print("\nFailed alloy indices:")
+    print(failed_alloys)
