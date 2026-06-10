@@ -27,10 +27,12 @@ min_liq = 0.005     # stop at 0.5% liquid
 
 def extract_final_value(data):
     values, temps = data
+
     values = np.asarray(values)
     temps = np.asarray(temps)
 
     idx = np.argmin(temps)
+
     return float(values[idx])
 
 
@@ -49,23 +51,24 @@ def get_unique_solid_phases(grouped_result):
 
 def get_cr_chemical_potential(result):
     """
-    Chemical potential of Cr at the final Scheil temperature.
+    Chemical potential of Cr at final Scheil temperature.
     Unit is usually J/mol.
     """
 
-    possible_console_quantities = [
+    possible_quantities = [
         "MU(CR)",
         "MU(Cr)",
         "MUR(CR)",
         "MUR(Cr)"
     ]
 
-    for q in possible_console_quantities:
+    for q in possible_quantities:
         try:
             data = result.get_values_of(
                 q,
                 ScheilQuantity.temperature()
             )
+
             return extract_final_value(data)
 
         except Exception:
@@ -113,7 +116,14 @@ df_combined_chemistries = pd.DataFrame(
     index=input_frame_nonan.index
 )
 
+print("\nPrepared compositions:")
+print(df_combined_chemistries.head())
+
+
+# =========================
 # Output dataframe
+# =========================
+
 df_out = df_combined_chemistries[elem].copy()
 
 all_solid_phases = []
@@ -123,7 +133,7 @@ start_time = time.time()
 
 
 # =========================
-# Run Scheil calculation
+# Run Thermo-Calc
 # =========================
 
 start_api_server()
@@ -167,7 +177,7 @@ try:
         try:
             grouped = result.get_values_grouped_by_stable_phases_of(
                 ScheilQuantity.temperature(),
-                ScheilQuantity.mass_fraction_of_all_solid_phases()
+                ScheilQuantity.volume_fraction_of_all_solid_phases()
             )
 
             solid_phases = get_unique_solid_phases(grouped)
@@ -180,10 +190,10 @@ try:
 
         print("Solid phases found:", solid_phases)
 
-        # Chemical potential of Cr at final Scheil temperature
         mu_cr = get_cr_chemical_potential(result)
 
         for ph in solid_phases:
+
             mu_col = f"{ph}_Cr_chemical_potential_J_per_mol"
 
             if mu_col not in df_out.columns:
@@ -210,6 +220,7 @@ for ph in all_solid_phases:
     ordered_cols.append(f"{ph}_Cr_chemical_potential_J_per_mol")
 
 ordered_cols = [col for col in ordered_cols if col in df_out.columns]
+
 df_out = df_out[ordered_cols]
 
 
