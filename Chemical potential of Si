@@ -1,0 +1,242 @@
+import numpy as np
+import pandas as pd
+import time
+from tc_python import *
+
+# =========================
+# User settings
+# =========================
+
+input_file = "./6000.csv"
+output_file = "SiChemicalPotential_FormedPhases_Scheil_6000.csv"
+
+database = "TCAL10"
+
+base = "Al"
+elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
+all_inputs_list = [base] + elem
+
+t_start = 1600      # K
+t_step = 1.0        # K
+min_liq = 0.005     # stop at 0.5% liquid
+
+
+# =========================
+# Helper functions
+# =========================
+
+def extract_final_value(data):
+    values, temps = data
+
+    values = np.asarray(values)
+    temps = np.asarray(temps)
+
+    # Final Scheil condition is usually at the lowest temperature
+    idx = np.argmin(temps)
+
+    return float(values[idx])
+
+
+def get_unique_solid_phases(grouped_result):
+    unique_phases = []
+
+    for mixture in grouped_result.keys():
+        phases = mixture.split(" + ")
+
+        for ph in phases:
+            if ph != "LIQUID" and ph not in unique_phases:
+                unique_phases.append(ph)
+
+    return unique_phases
+
+
+def get_si_chemical_potential(result):
+    """
+    Chemical potential of Si at final Scheil temperature.
+    Unit is usually J/mol.
+    """
+
+    possible_quantities = [
+        "MU(SI)",
+        "MU(Si)",
+        "MUR(SI)",
+        "MUR(Si)"
+    ]
+
+    for q in possible_quantities:
+        try:
+            data = result.get_values_of(
+                q,
+                ScheilQuantity.temperature()
+            )
+
+            return extract_final_value(data)
+
+        except Exception:
+            pass
+
+    print("Could not get chemical potential of Si.")
+    return np.nan
+
+
+# =========================
+# Read input file
+# =========================
+
+df_inp = pd.read_csv(input_file)
+
+print("Input columns:")
+print(list(df_inp.columns.values))
+
+missing_cols = [col for col in elem if col not in df_inp.columns]
+
+if missing_cols:
+    raise ValueError(f"Missing required input columns: {missing_cols}")
+
+input_frame = df_inp[elem]
+input_frame_nonan = input_frame.dropna(axis=0).copy()
+
+input_values = input_frame_nonan.values.astype(float)
+
+solute_sum = np.sum(input_values, axis=1)
+
+if np.any(solute_sum > 100.0):
+    bad_rows = input_frame_nonan.index[solute_sum > 100.0].tolist()
+    raise ValueError(
+        f"Some rows have solute sum greater than 100 wt%. Bad rows: {bad_rows}"
+    )
+
+al_content = 100.0 - solute_sum
+al_content = np.reshape(al_content, (len(al_content), -1))
+
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+
+df_combined_chemistries = pd.DataFrame(
+    all_chemistries,
+    columns=all_inputs_list,
+    index=input_frame_nonan.index
+)
+
+print("\nPrepared compositions:")
+print(df_combined_chemistries.head())
+
+
+# =========================
+# Output dataframe
+# =========================
+
+df_out = df_combined_chemistries[elem].copy()
+
+all_solid_phases = []
+failed_alloys = []
+
+start_time = time.time()
+
+
+# =========================
+# Run Thermo-Calc
+# =========================
+
+start_api_server()
+
+try:
+    system = (
+        SetUp()
+        .select_database_and_elements(database, all_inputs_list)
+        .get_system()
+    )
+
+    calculator = (
+        system
+        .with_scheil_calculation()
+        .with_options(ScheilOptions().set_temperature_step(t_step))
+        .with_options(ScheilOptions().terminate_on_fraction_of_liquid_phase(min_liq))
+        .enable_global_minimization()
+        .set_start_temperature(t_start)
+        .set_composition_unit(CompositionUnit.MASS_PERCENT)
+    )
+
+    for index, row in df_combined_chemistries.iterrows():
+
+        print("\n==============================")
+        print(f"Running alloy index: {index}")
+        print(row)
+        print("==============================")
+
+        for el in elem:
+            calculator.set_composition(el, row[el])
+
+        try:
+            result = calculator.calculate()
+
+        except Exception as e:
+            print(f"ERROR: Scheil calculation failed for alloy index {index}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        try:
+            grouped = result.get_values_grouped_by_stable_phases_of(
+                ScheilQuantity.temperature(),
+                ScheilQuantity.volume_fraction_of_all_solid_phases()
+            )
+
+            solid_phases = get_unique_solid_phases(grouped)
+
+        except Exception as e:
+            print(f"ERROR: Could not get formed phases for alloy index {index}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        print("Solid phases found:", solid_phases)
+
+        mu_si = get_si_chemical_potential(result)
+
+        for ph in solid_phases:
+
+            mu_col = f"{ph}_Si_chemical_potential_J_per_mol"
+
+            if mu_col not in df_out.columns:
+                df_out[mu_col] = np.nan
+
+            df_out.loc[index, mu_col] = mu_si
+
+            if ph not in all_solid_phases:
+                all_solid_phases.append(ph)
+
+            print(f"{ph}: mu_Si = {mu_si} J/mol")
+
+finally:
+    stop_api_server()
+
+
+# =========================
+# Reorder columns
+# =========================
+
+ordered_cols = elem.copy()
+
+for ph in all_solid_phases:
+    ordered_cols.append(f"{ph}_Si_chemical_potential_J_per_mol")
+
+ordered_cols = [col for col in ordered_cols if col in df_out.columns]
+
+df_out = df_out[ordered_cols]
+
+
+# =========================
+# Save output
+# =========================
+
+df_out.to_csv(output_file, index=True, index_label="Input_index")
+
+end_time = time.time()
+
+print("\nCalculation finished.")
+print("Calculation time:", end_time - start_time, "seconds")
+print("Output file:", output_file)
+
+if failed_alloys:
+    print("Failed alloy indices:")
+    print(failed_alloys)
