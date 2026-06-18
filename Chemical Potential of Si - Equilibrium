@@ -1,0 +1,341 @@
+import numpy as np
+import pandas as pd
+import time
+from tc_python import *
+
+# =========================
+# User settings
+# =========================
+
+input_file = "./6000.csv"
+output_file = "SiChemicalPotential_AL15SI2M4_Equilibrium_700_to_100C.csv"
+
+database = "TCAL10"
+
+base = "Al"
+elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
+all_inputs_list = [base] + elem
+
+target_phase = "AL15SI2M4"
+
+# Temperature range in Celsius
+t_start_C = 700
+t_end_C = 100
+t_step_C = -10      # use -10 for cooling from 700C to 100C
+
+# Small tolerance for deciding whether the phase is present
+phase_amount_tolerance = 1e-10
+
+
+# =========================
+# Helper functions
+# =========================
+
+def celsius_to_kelvin(temp_C):
+    return temp_C + 273.15
+
+
+def get_si_chemical_potential_equilibrium(result):
+    """
+    Get chemical potential of Si from single equilibrium result.
+    Unit is usually J/mol.
+    """
+
+    possible_quantities = [
+        "MU(SI)",
+        "MU(Si)",
+        "MUR(SI)",
+        "MUR(Si)"
+    ]
+
+    for q in possible_quantities:
+        try:
+            value = result.get_value_of(q)
+            return float(value)
+        except Exception:
+            pass
+
+    print("WARNING: Could not get chemical potential of Si.")
+    return np.nan
+
+
+def get_phase_amount(result, phase_name):
+    """
+    Try to get amount/fraction of a phase from equilibrium result.
+
+    Different Thermo-Calc versions/databases may accept different
+    quantity strings. This function tries several common options.
+
+    W(phase)  = mass fraction of phase, if available
+    NP(phase) = mole fraction / phase amount type quantity, if available
+    """
+
+    possible_quantities = [
+        f"W({phase_name})",
+        f"NP({phase_name})",
+        f"NPM({phase_name})",
+        f"BPW({phase_name})"
+    ]
+
+    for q in possible_quantities:
+        try:
+            value = result.get_value_of(q)
+            return float(value), q
+        except Exception:
+            pass
+
+    return np.nan, None
+
+
+def is_phase_present(phase_amount):
+    """
+    Decide if phase is stable/present.
+    """
+
+    if np.isnan(phase_amount):
+        return False
+
+    if phase_amount > phase_amount_tolerance:
+        return True
+
+    return False
+
+
+# =========================
+# Read input file
+# =========================
+
+df_inp = pd.read_csv(input_file)
+
+print("Input columns:")
+print(list(df_inp.columns.values))
+
+missing_cols = [col for col in elem if col not in df_inp.columns]
+
+if missing_cols:
+    raise ValueError(f"Missing required input columns: {missing_cols}")
+
+input_frame = df_inp[elem]
+input_frame_nonan = input_frame.dropna(axis=0).copy()
+
+input_values = input_frame_nonan.values.astype(float)
+
+solute_sum = np.sum(input_values, axis=1)
+
+if np.any(solute_sum > 100.0):
+    bad_rows = input_frame_nonan.index[solute_sum > 100.0].tolist()
+    raise ValueError(
+        f"Some rows have solute sum greater than 100 wt%. Bad rows: {bad_rows}"
+    )
+
+al_content = 100.0 - solute_sum
+al_content = np.reshape(al_content, (len(al_content), -1))
+
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+
+df_combined_chemistries = pd.DataFrame(
+    all_chemistries,
+    columns=all_inputs_list,
+    index=input_frame_nonan.index
+)
+
+print("\nPrepared compositions:")
+print(df_combined_chemistries.head())
+
+
+# =========================
+# Optional: test only first alloy
+# =========================
+# Keep this active for first test.
+# After confirming the code works, comment it out.
+
+# df_combined_chemistries = df_combined_chemistries.head(1)
+
+
+# =========================
+# Temperature list
+# =========================
+
+temperatures_C = np.arange(t_start_C, t_end_C + t_step_C, t_step_C)
+
+print("\nTemperature range:")
+print(temperatures_C)
+
+
+# =========================
+# Output storage
+# =========================
+
+output_rows = []
+failed_calculations = []
+
+start_time = time.time()
+
+
+# =========================
+# Run Thermo-Calc equilibrium calculations
+# =========================
+
+start_api_server()
+
+try:
+    system = (
+        SetUp()
+        .select_database_and_elements(database, all_inputs_list)
+        .get_system()
+    )
+
+    for index, row in df_combined_chemistries.iterrows():
+
+        print("\n==============================")
+        print(f"Running alloy index: {index}")
+        print(row)
+        print("==============================")
+
+        alloy_start_time = time.time()
+
+        for temp_C in temperatures_C:
+
+            temp_K = celsius_to_kelvin(temp_C)
+
+            print(f"  Calculating equilibrium at {temp_C:.1f} C / {temp_K:.2f} K")
+
+            try:
+                calculator = (
+                    system
+                    .with_single_equilibrium_calculation()
+                    .set_condition(
+                        ThermodynamicQuantity.temperature(),
+                        temp_K
+                    )
+                )
+
+                # Set composition using mass fraction.
+                # Input CSV is wt%, so divide by 100.
+                # Al is dependent balance element and is not set directly.
+                for el in elem:
+                    calculator.set_condition(
+                        ThermodynamicQuantity.mass_fraction_of_a_component(el),
+                        row[el] / 100.0
+                    )
+
+                result = calculator.calculate()
+
+                mu_si = get_si_chemical_potential_equilibrium(result)
+
+                phase_amount, phase_amount_quantity = get_phase_amount(
+                    result,
+                    target_phase
+                )
+
+                phase_present = is_phase_present(phase_amount)
+
+                if phase_present:
+                    mu_si_for_target_phase = mu_si
+                else:
+                    mu_si_for_target_phase = np.nan
+
+                output_row = {
+                    "Input_index": index,
+
+                    "Al_wt_percent": row["Al"],
+                    "Si_wt_percent": row["Si"],
+                    "Fe_wt_percent": row["Fe"],
+                    "Cu_wt_percent": row["Cu"],
+                    "Mn_wt_percent": row["Mn"],
+                    "Mg_wt_percent": row["Mg"],
+                    "Cr_wt_percent": row["Cr"],
+
+                    "Temperature_C": temp_C,
+                    "Temperature_K": temp_K,
+
+                    "Target_phase": target_phase,
+                    "Target_phase_present": phase_present,
+                    "Target_phase_amount": phase_amount,
+                    "Target_phase_amount_quantity": phase_amount_quantity,
+
+                    "Si_chemical_potential_J_per_mol": mu_si,
+                    f"Si_chemical_potential_in_{target_phase}_J_per_mol": mu_si_for_target_phase
+                }
+
+                output_rows.append(output_row)
+
+                print(
+                    f"    {target_phase} present: {phase_present}, "
+                    f"amount = {phase_amount}, "
+                    f"mu_Si = {mu_si} J/mol"
+                )
+
+            except Exception as e:
+                print(
+                    f"ERROR: equilibrium calculation failed for alloy index {index} "
+                    f"at {temp_C} C"
+                )
+                print(e)
+
+                failed_calculations.append(
+                    {
+                        "Input_index": index,
+                        "Temperature_C": temp_C,
+                        "Error": str(e)
+                    }
+                )
+
+                output_row = {
+                    "Input_index": index,
+
+                    "Al_wt_percent": row["Al"],
+                    "Si_wt_percent": row["Si"],
+                    "Fe_wt_percent": row["Fe"],
+                    "Cu_wt_percent": row["Cu"],
+                    "Mn_wt_percent": row["Mn"],
+                    "Mg_wt_percent": row["Mg"],
+                    "Cr_wt_percent": row["Cr"],
+
+                    "Temperature_C": temp_C,
+                    "Temperature_K": temp_K,
+
+                    "Target_phase": target_phase,
+                    "Target_phase_present": False,
+                    "Target_phase_amount": np.nan,
+                    "Target_phase_amount_quantity": None,
+
+                    "Si_chemical_potential_J_per_mol": np.nan,
+                    f"Si_chemical_potential_in_{target_phase}_J_per_mol": np.nan
+                }
+
+                output_rows.append(output_row)
+
+            # Save partial output after each temperature
+            df_out_partial = pd.DataFrame(output_rows)
+            df_out_partial.to_csv(output_file, index=False)
+
+        alloy_end_time = time.time()
+
+        print(
+            f"Finished alloy index {index} in "
+            f"{alloy_end_time - alloy_start_time:.1f} seconds"
+        )
+
+finally:
+    stop_api_server()
+
+
+# =========================
+# Save final output
+# =========================
+
+df_out = pd.DataFrame(output_rows)
+
+df_out.to_csv(output_file, index=False)
+
+end_time = time.time()
+
+print("\nCalculation finished.")
+print("Total calculation time:", end_time - start_time, "seconds")
+print("Output file:", output_file)
+
+if failed_calculations:
+    print("\nFailed calculations:")
+    for item in failed_calculations:
+        print(item)
