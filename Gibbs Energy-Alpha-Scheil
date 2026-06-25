@@ -1,0 +1,366 @@
+import numpy as np
+import pandas as pd
+import time
+import os
+from tc_python import *
+
+
+# ============================================================
+# User settings
+# ============================================================
+
+input_file = r"./6000.csv"
+output_file = "Scheil_GM_AL15SI2M4_6000.csv"
+
+database = "TCAL10"
+
+base = "Al"
+elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
+all_inputs_list = [base] + elem
+
+target_phase = "AL15SI2M4"
+
+t_start = 1600.0      # K
+t_step = 1.0          # K
+min_liq = 0.005       # stop at 0.5 wt% liquid
+
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+def check_input_file(path):
+    print("Current working directory:")
+    print(os.getcwd())
+
+    print("\nLooking for input file:")
+    print(os.path.abspath(path))
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"\nInput file was not found:\n{os.path.abspath(path)}\n\n"
+            f"Put 6000.csv in this folder or use the full file path."
+        )
+
+
+def extract_scheil_curve(result, quantity, temperature_quantity):
+    """
+    Returns two arrays:
+        values, temperatures
+
+    Uses Scheil result.get_values_of().
+    """
+    values, temps = result.get_values_of(
+        quantity,
+        temperature_quantity
+    )
+
+    values = np.asarray(values, dtype=float)
+    temps = np.asarray(temps, dtype=float)
+
+    return values, temps
+
+
+def try_extract_scheil_curve(result, possible_quantities):
+    """
+    Try several Thermo-Calc Console Mode quantities.
+
+    For molar Gibbs energy of a phase, the most likely useful syntax is:
+        GM(AL15SI2M4)
+
+    Depending on TC version/database, sometimes phase instance syntax may be needed:
+        GM(AL15SI2M4#1)
+    """
+
+    last_error = None
+
+    for q in possible_quantities:
+        try:
+            values, temps = extract_scheil_curve(
+                result,
+                q,
+                ScheilQuantity.temperature()
+            )
+            return values, temps, q
+
+        except Exception as e:
+            last_error = e
+
+    raise last_error
+
+
+def try_extract_phase_amount_curve(result, phase_name):
+    """
+    Extract phase amount along Scheil path.
+
+    BS(PHASE) is commonly used for mass fraction of solid phase
+    in Scheil Console Mode.
+
+    Also tries the TC-Python ScheilQuantity form.
+    """
+
+    possible_quantities = [
+        ScheilQuantity.mass_fraction_of_a_solid_phase(phase_name),
+        f"BS({phase_name})",
+        f"BP({phase_name})",
+        f"NP({phase_name})",
+        f"BS({phase_name}#1)",
+        f"BP({phase_name}#1)",
+        f"NP({phase_name}#1)",
+    ]
+
+    last_error = None
+
+    for q in possible_quantities:
+        try:
+            values, temps = extract_scheil_curve(
+                result,
+                q,
+                ScheilQuantity.temperature()
+            )
+            return values, temps, q
+
+        except Exception as e:
+            last_error = e
+
+    print(f"Could not extract phase amount for {phase_name}: {last_error}")
+
+    return None, None, None
+
+
+def build_phase_curve_dataframe(
+    alloy_index,
+    composition_row,
+    temps_gm,
+    gm_values,
+    gm_quantity_used,
+    temps_phase_amount=None,
+    phase_amount_values=None,
+    phase_amount_quantity_used=None
+):
+    """
+    Create dataframe for one alloy result.
+    """
+
+    df = pd.DataFrame({
+        "Input_index": alloy_index,
+        "T_K": temps_gm,
+        "T_C": temps_gm - 273.15,
+        "Target_phase": target_phase,
+        "GM_quantity_used": gm_quantity_used,
+        f"{target_phase}_GM_J_per_mol": gm_values,
+    })
+
+    # Add composition columns
+    for el in all_inputs_list:
+        df[f"{el}_wt_percent"] = composition_row[el]
+
+    # Add phase amount if available
+    if temps_phase_amount is not None and phase_amount_values is not None:
+
+        df_amt = pd.DataFrame({
+            "T_K": temps_phase_amount,
+            f"{target_phase}_phase_amount": phase_amount_values
+        })
+
+        df = df.merge(df_amt, on="T_K", how="left")
+
+        df[f"{target_phase}_phase_amount_quantity_used"] = phase_amount_quantity_used
+
+        df[f"{target_phase}_phase_wt_percent_if_mass_fraction"] = (
+            df[f"{target_phase}_phase_amount"] * 100.0
+        )
+
+        df[f"{target_phase}_present"] = (
+            df[f"{target_phase}_phase_amount"].fillna(0.0) > 1e-12
+        )
+
+    else:
+        df[f"{target_phase}_phase_amount"] = np.nan
+        df[f"{target_phase}_phase_amount_quantity_used"] = None
+        df[f"{target_phase}_phase_wt_percent_if_mass_fraction"] = np.nan
+        df[f"{target_phase}_present"] = np.nan
+
+    return df
+
+
+# ============================================================
+# Read input file
+# ============================================================
+
+check_input_file(input_file)
+
+df_inp = pd.read_csv(input_file)
+
+print("\nInput columns:")
+print(list(df_inp.columns.values))
+
+missing_cols = [col for col in elem if col not in df_inp.columns]
+if missing_cols:
+    raise ValueError(f"Missing required input columns: {missing_cols}")
+
+input_frame = df_inp[elem]
+input_frame_nonan = input_frame.dropna(axis=0).copy()
+
+input_values = input_frame_nonan.values.astype(float)
+
+solute_sum = np.sum(input_values, axis=1)
+if np.any(solute_sum > 100.0):
+    bad_rows = input_frame_nonan.index[solute_sum > 100.0].tolist()
+    raise ValueError(
+        f"Some rows have solute sum greater than 100 wt%. Bad rows: {bad_rows}"
+    )
+
+al_content = 100.0 - solute_sum
+al_content = np.reshape(al_content, (len(al_content), -1))
+
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+
+df_combined_chemistries = pd.DataFrame(
+    all_chemistries,
+    columns=all_inputs_list,
+    index=input_frame_nonan.index
+)
+
+print("\nPrepared compositions:")
+print(df_combined_chemistries.head())
+
+
+# ============================================================
+# Run Scheil calculations
+# ============================================================
+
+all_results = []
+failed_alloys = []
+
+start_time = time.time()
+
+start_api_server()
+
+try:
+    system = (
+        SetUp()
+        .select_database_and_elements(database, all_inputs_list)
+        .get_system()
+    )
+
+    calculator = (
+        system
+        .with_scheil_calculation()
+        .with_options(ScheilOptions().set_temperature_step(t_step))
+        .with_options(ScheilOptions().terminate_on_fraction_of_liquid_phase(min_liq))
+        .enable_global_minimization()
+        .set_start_temperature(t_start)
+        .set_composition_unit(CompositionUnit.MASS_PERCENT)
+    )
+
+    for index, row in df_combined_chemistries.iterrows():
+
+        print("\n==============================")
+        print(f"Running alloy index: {index}")
+        print(row)
+        print("==============================")
+
+        for el in elem:
+            calculator.set_composition(el, row[el])
+
+        try:
+            result = calculator.calculate()
+
+        except Exception as e:
+            print(f"ERROR: Scheil calculation failed for alloy index {index}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        # ====================================================
+        # Extract molar Gibbs energy of AL15SI2M4
+        # ====================================================
+
+        possible_gm_quantities = [
+            f"GM({target_phase})",
+            f"GM({target_phase}#1)",
+            f"G({target_phase})",
+            f"G({target_phase}#1)",
+        ]
+
+        try:
+            gm_values, temps_gm, gm_quantity_used = try_extract_scheil_curve(
+                result,
+                possible_gm_quantities
+            )
+
+            print(f"Successfully extracted Gibbs energy using: {gm_quantity_used}")
+
+        except Exception as e:
+            print(f"ERROR: Could not extract Gibbs energy for {target_phase}")
+            print(e)
+            failed_alloys.append(index)
+            continue
+
+        # ====================================================
+        # Extract phase amount of AL15SI2M4
+        # ====================================================
+
+        phase_amount_values, temps_phase_amount, phase_amount_quantity_used = (
+            try_extract_phase_amount_curve(result, target_phase)
+        )
+
+        if phase_amount_quantity_used is not None:
+            print(
+                f"Successfully extracted phase amount using: "
+                f"{phase_amount_quantity_used}"
+            )
+        else:
+            print(f"Phase amount was not extracted for {target_phase}")
+
+        # ====================================================
+        # Build dataframe for this alloy
+        # ====================================================
+
+        df_one = build_phase_curve_dataframe(
+            alloy_index=index,
+            composition_row=row,
+            temps_gm=temps_gm,
+            gm_values=gm_values,
+            gm_quantity_used=gm_quantity_used,
+            temps_phase_amount=temps_phase_amount,
+            phase_amount_values=phase_amount_values,
+            phase_amount_quantity_used=phase_amount_quantity_used
+        )
+
+        all_results.append(df_one)
+
+finally:
+    stop_api_server()
+
+
+# ============================================================
+# Save output
+# ============================================================
+
+if len(all_results) == 0:
+    raise RuntimeError(
+        "No successful results were generated. "
+        "Check whether AL15SI2M4 exists in your Scheil path."
+    )
+
+df_out = pd.concat(all_results, ignore_index=True)
+
+# Sort for cleaner plotting
+df_out = df_out.sort_values(
+    by=["Input_index", "T_K"],
+    ascending=[True, False]
+)
+
+df_out.to_csv(output_file, index=False)
+
+end_time = time.time()
+
+print("\nCalculation finished.")
+print("Calculation time:", end_time - start_time, "seconds")
+print("Output file:", output_file)
+
+if failed_alloys:
+    print("\nFailed alloy indices:")
+    print(failed_alloys)
