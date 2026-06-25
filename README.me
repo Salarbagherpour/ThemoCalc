@@ -1,13 +1,23 @@
+"C:\Program Files\Thermo-Calc\2026a\python\python.exe" "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\ThermoCalc\pyex_T_13_Phase_diagram_single_phase_region_shift_Al_Si_Cu.py_cache\Gibbs Energy-Alpha-Equi.py" 
 Traceback (most recent call last):
-  File "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\Cr Content  in phases and Phases quantity.py", line 143, in <module>
-    SetUp()
-  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\tc_python\server.py", line 769, in __init__
-    handle_exception(e)
-  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\tc_python\server.py", line 764, in __init__
-    self.set_ges_version(6)
-  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\tc_python\server.py", line 993, in set_ges_version
-    handle_exception(e)
-  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\tc_python\exceptions.py", line 126, in handle_exception
-    raise exception from None
-tc_python.exceptions.CalculationException: Thermo-Calc calculation error: java.lang.RuntimeException: se.thermocalc.core.LicenseException: Contacting license manager gave an error:
-Error[3]: Failed to resolve the server host "KSWNNAWPLICAP01".
+  File "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\ThermoCalc\pyex_T_13_Phase_diagram_single_phase_region_shift_Al_Si_Cu.py_cache\Gibbs Energy-Alpha-Equi.py", line 109, in <module>
+    df_inp = pd.read_csv(input_file)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\parsers\readers.py", line 1026, in read_csv
+    return _read(filepath_or_buffer, kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\parsers\readers.py", line 620, in _read
+    parser = TextFileReader(filepath_or_buffer, **kwds)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\parsers\readers.py", line 1620, in __init__
+    self._engine = self._make_engine(f, self.engine)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\parsers\readers.py", line 1880, in _make_engine
+    self.handles = get_handle(
+                   ^^^^^^^^^^^
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\common.py", line 873, in get_handle
+    handle = open(
+             ^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: './6000.csv'
+
+Process finished with exit code 1
