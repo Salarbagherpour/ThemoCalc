@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import time
+import os
 from tc_python import *
 
 
@@ -8,8 +9,8 @@ from tc_python import *
 # User settings
 # ============================================================
 
-input_file = "./6000.csv"
-output_file = "GibbsEnergy_ALPHA_AL15SI2M4_Equilibrium_6000.csv"
+input_file = r"./6000.csv"
+output_file = "Fast_Equilibrium_GM_AL15SI2M4_6000.csv"
 
 database = "TCAL10"
 
@@ -17,15 +18,26 @@ base = "Al"
 elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
 all_inputs_list = [base] + elem
 
-# Target phase
-target_phase = "AL15SI2M4"      # alpha phase in your question
+target_phase = "AL15SI2M4"
 
 # Temperature range
-t_start_C = 700.0               # Celsius
-t_end_C = 100.0                 # Celsius
-t_step_C = -10.0                # negative because cooling from 700 to 100 C
+t_high_C = 700.0
+t_low_C = 100.0
 
-pressure = 101325               # Pa
+# Fast search settings
+coarse_step_C = 50.0      # first scan step
+fine_step_C = 10.0        # final output step
+extra_window_C = 50.0     # add extra range above/below detected region
+
+# Stop control
+stop_after_absent_points = 6
+max_alloys = None         # use None for all alloys, or set e.g. 5 for testing
+
+pressure = 101325.0       # Pa
+
+# Global minimization is accurate but slower.
+# Start with False for speed. If results look wrong, change to True.
+use_global_minimization = False
 
 
 # ============================================================
@@ -36,16 +48,47 @@ def c_to_k(t_c):
     return t_c + 273.15
 
 
-def safe_get_value(result, quantity_list):
-    """
-    Try several possible Thermo-Calc console quantities.
-    Returns np.nan if all fail.
+def check_input_file(path):
+    print("Current working directory:")
+    print(os.getcwd())
 
-    For Gibbs energy of a phase, common possibilities are:
-        GM(PHASE)  = molar Gibbs energy of phase, usually J/mol
-        G(PHASE)   = Gibbs energy of phase, depending on Thermo-Calc syntax
+    print("\nLooking for input file:")
+    print(os.path.abspath(path))
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"\nInput file was not found:\n{os.path.abspath(path)}\n\n"
+            f"Put 6000.csv in this folder or use the full file path."
+        )
+
+
+def make_temperature_list(t_high, t_low, step):
     """
-    for q in quantity_list:
+    Creates finite temperature list from high to low.
+    Prevents accidental endless or extremely long loops.
+    """
+    if step <= 0:
+        raise ValueError("Temperature step must be positive.")
+
+    if t_high < t_low:
+        raise ValueError("t_high_C must be larger than t_low_C.")
+
+    n_steps = int(np.floor((t_high - t_low) / step)) + 1
+    temps = [t_high - i * step for i in range(n_steps)]
+
+    # Make sure lower limit is included if needed
+    if temps[-1] > t_low:
+        temps.append(t_low)
+
+    return np.array(temps, dtype=float)
+
+
+def safe_get_value(result, possible_quantities):
+    """
+    Try different Thermo-Calc console quantities.
+    Returns np.nan if all fail.
+    """
+    for q in possible_quantities:
         try:
             return float(result.get_value_of(q))
         except Exception:
@@ -56,59 +99,105 @@ def safe_get_value(result, quantity_list):
 
 def get_phase_amount(result, phase_name):
     """
-    Try to get phase amount / phase fraction.
-    Different TC-Python / Thermo-Calc versions may accept different syntax.
+    Try to get phase amount for equilibrium calculation.
 
-    NP(PHASE) = mole amount / mole fraction type phase amount
-    BP(PHASE) = mass fraction / mass amount type phase amount
+    NP(PHASE) is often phase mole amount/fraction type.
+    BP(PHASE) or BS(PHASE) may work depending on TC version/result type.
     """
-    phase_np = safe_get_value(
+    return safe_get_value(
         result,
         [
             f"NP({phase_name})",
-            f"NPM({phase_name})",
-        ]
-    )
-
-    phase_bp = safe_get_value(
-        result,
-        [
             f"BP({phase_name})",
             f"BS({phase_name})",
+            f"NP({phase_name}#1)",
+            f"BP({phase_name}#1)",
+            f"BS({phase_name}#1)",
         ]
     )
-
-    return phase_np, phase_bp
 
 
 def get_phase_gibbs_energy(result, phase_name):
     """
-    Returns Gibbs free energy of the selected phase.
-
-    The most likely useful quantity is:
-        GM(AL15SI2M4)
-
-    This is normally molar Gibbs energy of the phase.
-    Unit is usually J/mol.
+    Molar Gibbs energy of the phase.
+    Usually GM(PHASE), unit usually J/mol.
     """
     return safe_get_value(
         result,
         [
             f"GM({phase_name})",
-            f"G({phase_name})",
             f"GM({phase_name}#1)",
+            f"G({phase_name})",
             f"G({phase_name}#1)",
         ]
     )
+
+
+def calculate_one_equilibrium(calculator, row, temperature_C):
+    """
+    Run one equilibrium calculation at one temperature and one composition.
+    """
+
+    temperature_K = c_to_k(temperature_C)
+
+    calculator.set_condition(
+        ThermodynamicQuantity.temperature(),
+        temperature_K
+    )
+
+    calculator.set_condition(
+        ThermodynamicQuantity.pressure(),
+        pressure
+    )
+
+    # Set N-1 composition conditions.
+    # Base Al is automatically balance.
+    for el in elem:
+        calculator.set_condition(
+            ThermodynamicQuantity.mass_fraction_of_a_component(el),
+            row[el] / 100.0
+        )
+
+    result = calculator.calculate()
+
+    phase_amount = get_phase_amount(result, target_phase)
+    phase_present = False
+
+    if not pd.isna(phase_amount) and phase_amount > 1e-12:
+        phase_present = True
+
+    if phase_present:
+        gm = get_phase_gibbs_energy(result, target_phase)
+    else:
+        gm = np.nan
+
+    return {
+        "T_C": temperature_C,
+        "T_K": temperature_K,
+        f"{target_phase}_phase_amount": phase_amount,
+        f"{target_phase}_present": phase_present,
+        f"{target_phase}_GM_J_per_mol": gm
+    }
+
+
+def make_calculator(system):
+    calc = system.with_single_equilibrium_calculation()
+
+    if use_global_minimization:
+        calc = calc.enable_global_minimization()
+
+    return calc
 
 
 # ============================================================
 # Read input file
 # ============================================================
 
+check_input_file(input_file)
+
 df_inp = pd.read_csv(input_file)
 
-print("Input columns:")
+print("\nInput columns:")
 print(list(df_inp.columns.values))
 
 missing_cols = [col for col in elem if col not in df_inp.columns]
@@ -117,6 +206,9 @@ if missing_cols:
 
 input_frame = df_inp[elem]
 input_frame_nonan = input_frame.dropna(axis=0).copy()
+
+if max_alloys is not None:
+    input_frame_nonan = input_frame_nonan.iloc[:max_alloys].copy()
 
 input_values = input_frame_nonan.values.astype(float)
 
@@ -143,33 +235,27 @@ print(df_combined_chemistries.head())
 
 
 # ============================================================
-# Temperature list
+# Temperature lists
 # ============================================================
 
-temps_C = np.arange(t_start_C, t_end_C + t_step_C, t_step_C)
+coarse_temps_C = make_temperature_list(
+    t_high_C,
+    t_low_C,
+    coarse_step_C
+)
 
-# Safety correction in case np.arange passes below endpoint
-if t_step_C < 0:
-    temps_C = temps_C[temps_C >= t_end_C]
-else:
-    temps_C = temps_C[temps_C <= t_end_C]
-
-temps_K = c_to_k(temps_C)
+print("\nCoarse temperature list:")
+print(coarse_temps_C)
 
 
 # ============================================================
-# Output storage
+# Run Thermo-Calc
 # ============================================================
 
-rows_out = []
+all_output_rows = []
 failed_cases = []
 
 start_time = time.time()
-
-
-# ============================================================
-# Run Thermo-Calc equilibrium calculations
-# ============================================================
 
 start_api_server()
 
@@ -180,12 +266,6 @@ try:
         .get_system()
     )
 
-    calculator = (
-        system
-        .with_single_equilibrium_calculation()
-        .enable_global_minimization()
-    )
-
     for index, row in df_combined_chemistries.iterrows():
 
         print("\n==============================")
@@ -193,87 +273,66 @@ try:
         print(row)
         print("==============================")
 
-        for T_C, T_K in zip(temps_C, temps_K):
+        calculator = make_calculator(system)
 
-            print(f"Temperature: {T_C:.1f} C / {T_K:.2f} K")
+        # ====================================================
+        # Step 1: coarse scan to find AL15SI2M4 region
+        # ====================================================
+
+        coarse_results = []
+
+        print("\nStarting coarse scan...")
+
+        for T_C in coarse_temps_C:
 
             try:
-                # Remove previous conditions if your TC-Python version requires it.
-                # Most versions overwrite the same condition when set again.
-
-                calculator.set_condition(
-                    ThermodynamicQuantity.temperature(),
-                    T_K
+                r = calculate_one_equilibrium(
+                    calculator=calculator,
+                    row=row,
+                    temperature_C=T_C
                 )
 
-                calculator.set_condition(
-                    ThermodynamicQuantity.pressure(),
-                    pressure
-                )
-
-                # Set solute compositions as MASS FRACTION, not mass percent.
-                # Example: 0.5 wt% Cr -> 0.005 mass fraction
-                for el in elem:
-                    calculator.set_condition(
-                        ThermodynamicQuantity.mass_fraction_of_a_component(el),
-                        row[el] / 100.0
-                    )
-
-                result = calculator.calculate()
-
-                alpha_gibbs = get_phase_gibbs_energy(result, target_phase)
-                alpha_np, alpha_bp = get_phase_amount(result, target_phase)
-
-                phase_is_present = False
-                if not pd.isna(alpha_np) and alpha_np > 1e-12:
-                    phase_is_present = True
-                if not pd.isna(alpha_bp) and alpha_bp > 1e-12:
-                    phase_is_present = True
-
-                rows_out.append({
-                    "Input_index": index,
-                    "T_C": T_C,
-                    "T_K": T_K,
-
-                    "Al_wt_percent": row["Al"],
-                    "Si_wt_percent": row["Si"],
-                    "Fe_wt_percent": row["Fe"],
-                    "Cu_wt_percent": row["Cu"],
-                    "Mn_wt_percent": row["Mn"],
-                    "Mg_wt_percent": row["Mg"],
-                    "Cr_wt_percent": row["Cr"],
-
-                    "Target_phase": target_phase,
-                    f"{target_phase}_Gibbs_energy": alpha_gibbs,
-                    f"{target_phase}_phase_amount_NP": alpha_np,
-                    f"{target_phase}_phase_amount_BP_or_BS": alpha_bp,
-                    f"{target_phase}_present": phase_is_present,
-                })
+                coarse_results.append(r)
 
                 print(
-                    f"{target_phase}: G = {alpha_gibbs}, "
-                    f"NP = {alpha_np}, BP/BS = {alpha_bp}, "
-                    f"present = {phase_is_present}"
+                    f"Coarse T = {T_C:.1f} C, "
+                    f"present = {r[f'{target_phase}_present']}, "
+                    f"amount = {r[f'{target_phase}_phase_amount']}"
                 )
 
             except Exception as e:
-                print(
-                    f"ERROR: equilibrium failed for alloy index {index} "
-                    f"at T = {T_C} C"
-                )
+                print(f"Coarse scan failed at alloy {index}, T = {T_C} C")
                 print(e)
 
                 failed_cases.append({
                     "Input_index": index,
                     "T_C": T_C,
+                    "Stage": "coarse",
                     "Error": str(e)
                 })
 
-                rows_out.append({
-                    "Input_index": index,
-                    "T_C": T_C,
-                    "T_K": T_K,
+        df_coarse = pd.DataFrame(coarse_results)
 
+        if df_coarse.empty:
+            print(f"No coarse results for alloy {index}. Skipping this alloy.")
+            continue
+
+        present_rows = df_coarse[
+            df_coarse[f"{target_phase}_present"] == True
+        ]
+
+        # If AL15SI2M4 is never present, save coarse info and skip fine scan.
+        if present_rows.empty:
+            print(
+                f"{target_phase} was not present in coarse scan "
+                f"for alloy index {index}. Skipping fine scan."
+            )
+
+            for _, rr in df_coarse.iterrows():
+                output_row = {
+                    "Input_index": index,
+                    "Scan_type": "coarse_only_no_phase",
+                    "Target_phase": target_phase,
                     "Al_wt_percent": row["Al"],
                     "Si_wt_percent": row["Si"],
                     "Fe_wt_percent": row["Fe"],
@@ -281,24 +340,130 @@ try:
                     "Mn_wt_percent": row["Mn"],
                     "Mg_wt_percent": row["Mg"],
                     "Cr_wt_percent": row["Cr"],
+                }
 
+                output_row.update(rr.to_dict())
+                all_output_rows.append(output_row)
+
+            pd.DataFrame(all_output_rows).to_csv(output_file, index=False)
+            continue
+
+        # ====================================================
+        # Step 2: define smaller fine scan window
+        # ====================================================
+
+        phase_t_high = present_rows["T_C"].max()
+        phase_t_low = present_rows["T_C"].min()
+
+        fine_high = min(t_high_C, phase_t_high + extra_window_C)
+        fine_low = max(t_low_C, phase_t_low - extra_window_C)
+
+        fine_temps_C = make_temperature_list(
+            fine_high,
+            fine_low,
+            fine_step_C
+        )
+
+        print("\nDetected phase region from coarse scan:")
+        print(f"{phase_t_high:.1f} C down to {phase_t_low:.1f} C")
+
+        print("\nFine scan window:")
+        print(f"{fine_high:.1f} C down to {fine_low:.1f} C")
+
+        print("\nFine temperature list:")
+        print(fine_temps_C)
+
+        # ====================================================
+        # Step 3: fine scan only near AL15SI2M4 region
+        # ====================================================
+
+        absent_after_found = 0
+        found_once = False
+
+        print("\nStarting fine scan...")
+
+        for T_C in fine_temps_C:
+
+            try:
+                r = calculate_one_equilibrium(
+                    calculator=calculator,
+                    row=row,
+                    temperature_C=T_C
+                )
+
+                phase_present = r[f"{target_phase}_present"]
+
+                if phase_present:
+                    found_once = True
+                    absent_after_found = 0
+                else:
+                    if found_once:
+                        absent_after_found += 1
+
+                output_row = {
+                    "Input_index": index,
+                    "Scan_type": "fine",
                     "Target_phase": target_phase,
-                    f"{target_phase}_Gibbs_energy": np.nan,
-                    f"{target_phase}_phase_amount_NP": np.nan,
-                    f"{target_phase}_phase_amount_BP_or_BS": np.nan,
-                    f"{target_phase}_present": False,
+                    "Al_wt_percent": row["Al"],
+                    "Si_wt_percent": row["Si"],
+                    "Fe_wt_percent": row["Fe"],
+                    "Cu_wt_percent": row["Cu"],
+                    "Mn_wt_percent": row["Mn"],
+                    "Mg_wt_percent": row["Mg"],
+                    "Cr_wt_percent": row["Cr"],
+                }
+
+                output_row.update(r)
+                all_output_rows.append(output_row)
+
+                print(
+                    f"Fine T = {T_C:.1f} C, "
+                    f"present = {phase_present}, "
+                    f"amount = {r[f'{target_phase}_phase_amount']}, "
+                    f"GM = {r[f'{target_phase}_GM_J_per_mol']}"
+                )
+
+                # Stop early after phase disappears
+                if absent_after_found >= stop_after_absent_points:
+                    print(
+                        f"Stopping fine scan for alloy {index}: "
+                        f"{target_phase} disappeared for "
+                        f"{stop_after_absent_points} consecutive points."
+                    )
+                    break
+
+            except Exception as e:
+                print(f"Fine scan failed at alloy {index}, T = {T_C} C")
+                print(e)
+
+                failed_cases.append({
+                    "Input_index": index,
+                    "T_C": T_C,
+                    "Stage": "fine",
+                    "Error": str(e)
                 })
+
+        # Save after each alloy
+        pd.DataFrame(all_output_rows).to_csv(output_file, index=False)
+        print(f"Saved partial output after alloy {index}")
 
 finally:
     stop_api_server()
 
 
 # ============================================================
-# Save output
+# Save final output
 # ============================================================
 
-df_out = pd.DataFrame(rows_out)
-df_out.to_csv(output_file, index=False)
+df_out = pd.DataFrame(all_output_rows)
+
+if not df_out.empty:
+    df_out = df_out.sort_values(
+        by=["Input_index", "T_C"],
+        ascending=[True, False]
+    )
+
+    df_out.to_csv(output_file, index=False)
 
 end_time = time.time()
 
@@ -307,6 +472,6 @@ print("Calculation time:", end_time - start_time, "seconds")
 print("Output file:", output_file)
 
 if failed_cases:
-    print("\nFailed cases:")
-    for item in failed_cases:
-        print(item)
+    failed_file = "Failed_cases_Equilibrium_GM_AL15SI2M4.csv"
+    pd.DataFrame(failed_cases).to_csv(failed_file, index=False)
+    print("Failed cases file:", failed_file)
