@@ -1,0 +1,312 @@
+import numpy as np
+import pandas as pd
+import time
+from tc_python import *
+
+
+# ============================================================
+# User settings
+# ============================================================
+
+input_file = "./6000.csv"
+output_file = "GibbsEnergy_ALPHA_AL15SI2M4_Equilibrium_6000.csv"
+
+database = "TCAL10"
+
+base = "Al"
+elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
+all_inputs_list = [base] + elem
+
+# Target phase
+target_phase = "AL15SI2M4"      # alpha phase in your question
+
+# Temperature range
+t_start_C = 700.0               # Celsius
+t_end_C = 100.0                 # Celsius
+t_step_C = -10.0                # negative because cooling from 700 to 100 C
+
+pressure = 101325               # Pa
+
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+def c_to_k(t_c):
+    return t_c + 273.15
+
+
+def safe_get_value(result, quantity_list):
+    """
+    Try several possible Thermo-Calc console quantities.
+    Returns np.nan if all fail.
+
+    For Gibbs energy of a phase, common possibilities are:
+        GM(PHASE)  = molar Gibbs energy of phase, usually J/mol
+        G(PHASE)   = Gibbs energy of phase, depending on Thermo-Calc syntax
+    """
+    for q in quantity_list:
+        try:
+            return float(result.get_value_of(q))
+        except Exception:
+            pass
+
+    return np.nan
+
+
+def get_phase_amount(result, phase_name):
+    """
+    Try to get phase amount / phase fraction.
+    Different TC-Python / Thermo-Calc versions may accept different syntax.
+
+    NP(PHASE) = mole amount / mole fraction type phase amount
+    BP(PHASE) = mass fraction / mass amount type phase amount
+    """
+    phase_np = safe_get_value(
+        result,
+        [
+            f"NP({phase_name})",
+            f"NPM({phase_name})",
+        ]
+    )
+
+    phase_bp = safe_get_value(
+        result,
+        [
+            f"BP({phase_name})",
+            f"BS({phase_name})",
+        ]
+    )
+
+    return phase_np, phase_bp
+
+
+def get_phase_gibbs_energy(result, phase_name):
+    """
+    Returns Gibbs free energy of the selected phase.
+
+    The most likely useful quantity is:
+        GM(AL15SI2M4)
+
+    This is normally molar Gibbs energy of the phase.
+    Unit is usually J/mol.
+    """
+    return safe_get_value(
+        result,
+        [
+            f"GM({phase_name})",
+            f"G({phase_name})",
+            f"GM({phase_name}#1)",
+            f"G({phase_name}#1)",
+        ]
+    )
+
+
+# ============================================================
+# Read input file
+# ============================================================
+
+df_inp = pd.read_csv(input_file)
+
+print("Input columns:")
+print(list(df_inp.columns.values))
+
+missing_cols = [col for col in elem if col not in df_inp.columns]
+if missing_cols:
+    raise ValueError(f"Missing required input columns: {missing_cols}")
+
+input_frame = df_inp[elem]
+input_frame_nonan = input_frame.dropna(axis=0).copy()
+
+input_values = input_frame_nonan.values.astype(float)
+
+solute_sum = np.sum(input_values, axis=1)
+if np.any(solute_sum > 100.0):
+    bad_rows = input_frame_nonan.index[solute_sum > 100.0].tolist()
+    raise ValueError(
+        f"Some rows have solute sum greater than 100 wt%. Bad rows: {bad_rows}"
+    )
+
+al_content = 100.0 - solute_sum
+al_content = np.reshape(al_content, (len(al_content), -1))
+
+all_chemistries = np.concatenate((al_content, input_values), axis=1)
+
+df_combined_chemistries = pd.DataFrame(
+    all_chemistries,
+    columns=all_inputs_list,
+    index=input_frame_nonan.index
+)
+
+print("\nPrepared compositions:")
+print(df_combined_chemistries.head())
+
+
+# ============================================================
+# Temperature list
+# ============================================================
+
+temps_C = np.arange(t_start_C, t_end_C + t_step_C, t_step_C)
+
+# Safety correction in case np.arange passes below endpoint
+if t_step_C < 0:
+    temps_C = temps_C[temps_C >= t_end_C]
+else:
+    temps_C = temps_C[temps_C <= t_end_C]
+
+temps_K = c_to_k(temps_C)
+
+
+# ============================================================
+# Output storage
+# ============================================================
+
+rows_out = []
+failed_cases = []
+
+start_time = time.time()
+
+
+# ============================================================
+# Run Thermo-Calc equilibrium calculations
+# ============================================================
+
+start_api_server()
+
+try:
+    system = (
+        SetUp()
+        .select_database_and_elements(database, all_inputs_list)
+        .get_system()
+    )
+
+    calculator = (
+        system
+        .with_single_equilibrium_calculation()
+        .enable_global_minimization()
+    )
+
+    for index, row in df_combined_chemistries.iterrows():
+
+        print("\n==============================")
+        print(f"Running alloy index: {index}")
+        print(row)
+        print("==============================")
+
+        for T_C, T_K in zip(temps_C, temps_K):
+
+            print(f"Temperature: {T_C:.1f} C / {T_K:.2f} K")
+
+            try:
+                # Remove previous conditions if your TC-Python version requires it.
+                # Most versions overwrite the same condition when set again.
+
+                calculator.set_condition(
+                    ThermodynamicQuantity.temperature(),
+                    T_K
+                )
+
+                calculator.set_condition(
+                    ThermodynamicQuantity.pressure(),
+                    pressure
+                )
+
+                # Set solute compositions as MASS FRACTION, not mass percent.
+                # Example: 0.5 wt% Cr -> 0.005 mass fraction
+                for el in elem:
+                    calculator.set_condition(
+                        ThermodynamicQuantity.mass_fraction_of_a_component(el),
+                        row[el] / 100.0
+                    )
+
+                result = calculator.calculate()
+
+                alpha_gibbs = get_phase_gibbs_energy(result, target_phase)
+                alpha_np, alpha_bp = get_phase_amount(result, target_phase)
+
+                phase_is_present = False
+                if not pd.isna(alpha_np) and alpha_np > 1e-12:
+                    phase_is_present = True
+                if not pd.isna(alpha_bp) and alpha_bp > 1e-12:
+                    phase_is_present = True
+
+                rows_out.append({
+                    "Input_index": index,
+                    "T_C": T_C,
+                    "T_K": T_K,
+
+                    "Al_wt_percent": row["Al"],
+                    "Si_wt_percent": row["Si"],
+                    "Fe_wt_percent": row["Fe"],
+                    "Cu_wt_percent": row["Cu"],
+                    "Mn_wt_percent": row["Mn"],
+                    "Mg_wt_percent": row["Mg"],
+                    "Cr_wt_percent": row["Cr"],
+
+                    "Target_phase": target_phase,
+                    f"{target_phase}_Gibbs_energy": alpha_gibbs,
+                    f"{target_phase}_phase_amount_NP": alpha_np,
+                    f"{target_phase}_phase_amount_BP_or_BS": alpha_bp,
+                    f"{target_phase}_present": phase_is_present,
+                })
+
+                print(
+                    f"{target_phase}: G = {alpha_gibbs}, "
+                    f"NP = {alpha_np}, BP/BS = {alpha_bp}, "
+                    f"present = {phase_is_present}"
+                )
+
+            except Exception as e:
+                print(
+                    f"ERROR: equilibrium failed for alloy index {index} "
+                    f"at T = {T_C} C"
+                )
+                print(e)
+
+                failed_cases.append({
+                    "Input_index": index,
+                    "T_C": T_C,
+                    "Error": str(e)
+                })
+
+                rows_out.append({
+                    "Input_index": index,
+                    "T_C": T_C,
+                    "T_K": T_K,
+
+                    "Al_wt_percent": row["Al"],
+                    "Si_wt_percent": row["Si"],
+                    "Fe_wt_percent": row["Fe"],
+                    "Cu_wt_percent": row["Cu"],
+                    "Mn_wt_percent": row["Mn"],
+                    "Mg_wt_percent": row["Mg"],
+                    "Cr_wt_percent": row["Cr"],
+
+                    "Target_phase": target_phase,
+                    f"{target_phase}_Gibbs_energy": np.nan,
+                    f"{target_phase}_phase_amount_NP": np.nan,
+                    f"{target_phase}_phase_amount_BP_or_BS": np.nan,
+                    f"{target_phase}_present": False,
+                })
+
+finally:
+    stop_api_server()
+
+
+# ============================================================
+# Save output
+# ============================================================
+
+df_out = pd.DataFrame(rows_out)
+df_out.to_csv(output_file, index=False)
+
+end_time = time.time()
+
+print("\nCalculation finished.")
+print("Calculation time:", end_time - start_time, "seconds")
+print("Output file:", output_file)
+
+if failed_cases:
+    print("\nFailed cases:")
+    for item in failed_cases:
+        print(item)
