@@ -1,0 +1,391 @@
+# ==================================================
+# Equilibrium phase quantity vs temperature
+# Cr removed
+# This code calculates and plots phase quantity
+# for all stable equilibrium phases for each alloy
+# ==================================================
+
+from tc_python import *
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+# ==================================================
+# SETTINGS
+# ==================================================
+DATABASE = "TCAL10"
+
+# Cr removed here
+ELEMENTS = ["AL", "SI", "FE", "CU", "MN", "MG"]
+
+INPUT_FILE = "6000.csv"
+OUTPUT_FILE = "phase_quantities_vs_temperature_no_Cr.xlsx"
+PLOT_FOLDER = "Phase_Quantity_Plots_no_Cr"
+
+T_START_C = 700
+T_END_C = 25
+T_STEP_C = 5
+
+SHOW_PLOTS = False
+
+EXCLUDED_PHASES = {"GAS", "IONIC_LIQ", "LIQUID"}
+
+# Cr removed here
+CHEM_COLS = ["Cu", "Fe", "Mg", "Mn", "Si"]
+
+
+# ==================================================
+# HELPERS
+# ==================================================
+def build_composition_from_row(row):
+    """
+    Convert input wt.% chemistry to mass fraction.
+    Al is balance and does not need to be set directly.
+    Cr is not included.
+    """
+    return {
+        "CU": float(row["Cu"]) / 100.0,
+        "FE": float(row["Fe"]) / 100.0,
+        "MG": float(row["Mg"]) / 100.0,
+        "MN": float(row["Mn"]) / 100.0,
+        "SI": float(row["Si"]) / 100.0
+    }
+
+
+def set_composition_conditions(calculator, composition_dict):
+    """
+    Set mass fraction conditions for all solute elements.
+    Al is automatically the balance element.
+    """
+    for el, val in composition_dict.items():
+        calculator.set_condition(
+            ThermodynamicQuantity.mass_fraction_of_a_component(el),
+            val
+        )
+    return calculator
+
+
+def safe_phase_volume_fraction(result, phase_name):
+    """
+    Safely get volume fraction of a phase.
+    If phase is not present, return zero.
+    """
+    try:
+        value = result.get_value_of(
+            ThermodynamicQuantity.volume_fraction_of_a_phase(phase_name)
+        )
+
+        if value is None:
+            return 0.0
+
+        value = float(value)
+
+        if np.isnan(value):
+            return 0.0
+
+        return max(0.0, value)
+
+    except Exception:
+        return 0.0
+
+
+def get_present_phases_from_result(result):
+    """
+    Try different possible TC-Python result methods
+    to get stable/present phases.
+    """
+    candidate_method_names = [
+        "get_stable_phases",
+        "get_present_phases",
+        "get_phases",
+        "stable_phases",
+        "present_phases",
+        "phases"
+    ]
+
+    for name in candidate_method_names:
+        if hasattr(result, name):
+            attr = getattr(result, name)
+
+            try:
+                value = attr() if callable(attr) else attr
+
+                if value is not None:
+                    phases = [str(p) for p in list(value)]
+                    phases = [
+                        p for p in phases
+                        if p and p.upper() not in EXCLUDED_PHASES
+                    ]
+
+                    if phases:
+                        return sorted(set(phases))
+
+            except Exception:
+                pass
+
+    return []
+
+
+def make_phase_plot(df_alloy, alloy_id, phase_columns, plot_folder):
+    """
+    Plot temperature on x-axis and phase quantity on y-axis.
+    One plot is saved for each alloy.
+    """
+
+    if len(df_alloy) == 0:
+        return
+
+    active_phase_columns = []
+
+    for ph in phase_columns:
+        if ph in df_alloy.columns and (df_alloy[ph] > 0).any():
+            active_phase_columns.append(ph)
+
+    if len(active_phase_columns) == 0:
+        return
+
+    plt.figure(figsize=(11, 7))
+
+    for ph in active_phase_columns:
+        plt.plot(
+            df_alloy["Temperature_C"],
+            df_alloy[ph],
+            marker="o",
+            markersize=3,
+            linewidth=1.8,
+            label=ph
+        )
+
+    plt.xlabel("Temperature, °C")
+    plt.ylabel("Phase Quantity, vol.%")
+    plt.title(f"Equilibrium Phase Quantity vs Temperature - Alloy {alloy_id}")
+
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend(fontsize=8, loc="best")
+
+    # Cooling direction: 700 C on left, 25 C on right
+    plt.gca().invert_xaxis()
+
+    plt.tight_layout()
+
+    plot_name = f"Alloy_{alloy_id}_Phase_Quantity_vs_Temperature_no_Cr.png"
+    plot_path = os.path.join(plot_folder, plot_name)
+
+    plt.savefig(plot_path, dpi=300)
+
+    if SHOW_PLOTS:
+        plt.show()
+
+    plt.close()
+
+
+# ==================================================
+# READ / CLEAN INPUT
+# ==================================================
+input_df = pd.read_csv(INPUT_FILE)
+
+if "Index" not in input_df.columns:
+    input_df.insert(0, "Index", range(1, len(input_df) + 1))
+
+for col in CHEM_COLS:
+    input_df[col] = pd.to_numeric(input_df[col], errors="coerce")
+
+bad_rows = input_df[input_df[CHEM_COLS].isna().any(axis=1)].copy()
+input_df = input_df.dropna(subset=CHEM_COLS).copy()
+
+print("Valid alloys loaded:", len(input_df))
+
+if len(bad_rows) > 0:
+    print("Rows skipped because of missing/non-numeric chemistry:")
+    print(bad_rows[["Index"] + CHEM_COLS])
+
+
+# ==================================================
+# TEMPERATURE LIST
+# ==================================================
+temperature_list_C = list(
+    np.arange(T_START_C, T_END_C - T_STEP_C, -T_STEP_C)
+)
+
+print("Temperature range:")
+print(f"{T_START_C} °C to {T_END_C} °C, step = {T_STEP_C} °C")
+print("Number of temperature points:", len(temperature_list_C))
+
+
+# ==================================================
+# MAIN CALCULATION
+# ==================================================
+scan_rows = []
+all_detected_phases = set()
+error_rows = []
+
+os.makedirs(PLOT_FOLDER, exist_ok=True)
+
+with TCPython() as session:
+
+    system = (
+        session
+        .select_database_and_elements(DATABASE, ELEMENTS)
+        .get_system()
+    )
+
+    for _, row in input_df.iterrows():
+
+        alloy_id = row["Index"]
+        composition = build_composition_from_row(row)
+
+        sum_solutes = sum(composition.values())
+
+        if sum_solutes >= 1.0:
+            error_rows.append({
+                "Alloy_ID": alloy_id,
+                "Temperature_C": None,
+                "Error": f"Sum of solute mass fractions >= 1.0 ({sum_solutes:.6f})"
+            })
+            continue
+
+        print(f"\nRunning alloy {alloy_id} ...")
+
+        for T_C in temperature_list_C:
+
+            T_K = T_C + 273.15
+
+            try:
+                calculator = system.with_single_equilibrium_calculation()
+
+                calculator.set_condition("T", T_K)
+
+                calculator = set_composition_conditions(
+                    calculator,
+                    composition
+                )
+
+                result = calculator.calculate()
+
+                present_phases = get_present_phases_from_result(result)
+
+                scan_row = {
+                    "Alloy_ID": alloy_id,
+                    "Temperature_C": T_C
+                }
+
+                for ph in present_phases:
+                    ph_clean = ph.strip()
+
+                    if ph_clean.upper() in EXCLUDED_PHASES:
+                        continue
+
+                    all_detected_phases.add(ph_clean)
+
+                    vf = safe_phase_volume_fraction(result, ph_clean)
+
+                    scan_row[ph_clean] = vf * 100.0
+
+                scan_rows.append(scan_row)
+
+                print(
+                    f"  T = {T_C:7.1f} °C | "
+                    f"Stable phases: {', '.join(present_phases) if present_phases else 'None found'}"
+                )
+
+            except Exception as e:
+                error_rows.append({
+                    "Alloy_ID": alloy_id,
+                    "Temperature_C": T_C,
+                    "Error": str(e)
+                })
+
+                print(f"  ERROR at {T_C} °C: {e}")
+
+                continue
+
+
+# ==================================================
+# BUILD OUTPUT DATAFRAME
+# ==================================================
+df_scan = pd.DataFrame(scan_rows)
+all_detected_phases = sorted(all_detected_phases)
+
+if len(df_scan) > 0:
+
+    for ph in all_detected_phases:
+        if ph not in df_scan.columns:
+            df_scan[ph] = 0.0
+
+    if len(all_detected_phases) > 0:
+        df_scan[all_detected_phases] = df_scan[all_detected_phases].fillna(0.0)
+
+    phase_cols_nonzero = []
+
+    for ph in all_detected_phases:
+        if (df_scan[ph] > 0).any():
+            phase_cols_nonzero.append(ph)
+
+    df_scan = df_scan[
+        ["Alloy_ID", "Temperature_C"] + phase_cols_nonzero
+    ]
+
+else:
+    phase_cols_nonzero = []
+
+df_errors = pd.DataFrame(error_rows)
+df_bad_rows = bad_rows.copy()
+
+
+# ==================================================
+# MAKE PLOTS
+# ==================================================
+if len(df_scan) > 0 and len(phase_cols_nonzero) > 0:
+
+    for alloy_id in df_scan["Alloy_ID"].unique():
+
+        df_alloy = df_scan[df_scan["Alloy_ID"] == alloy_id].copy()
+
+        df_alloy = df_alloy.sort_values(
+            by="Temperature_C",
+            ascending=False
+        )
+
+        make_phase_plot(
+            df_alloy=df_alloy,
+            alloy_id=alloy_id,
+            phase_columns=phase_cols_nonzero,
+            plot_folder=PLOT_FOLDER
+        )
+
+    print(f"\nPlots saved in folder: {PLOT_FOLDER}")
+
+else:
+    print("\nNo phase data available for plotting.")
+
+
+# ==================================================
+# EXPORT TO EXCEL
+# ==================================================
+with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+
+    if len(df_scan) > 0:
+        df_scan.to_excel(
+            writer,
+            sheet_name="Phase_vs_Temperature",
+            index=False
+        )
+
+    if len(df_errors) > 0:
+        df_errors.to_excel(
+            writer,
+            sheet_name="Errors",
+            index=False
+        )
+
+    if len(df_bad_rows) > 0:
+        df_bad_rows.to_excel(
+            writer,
+            sheet_name="Bad_Input_Rows",
+            index=False
+        )
+
+print("\nDone.")
+print(f"Results exported to: {OUTPUT_FILE}")
+print(f"Plots exported to folder: {PLOT_FOLDER}")
