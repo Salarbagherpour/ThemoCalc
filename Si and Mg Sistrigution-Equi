@@ -1,0 +1,56 @@
+# This code consider  fixed amount of Mg and Cr and calculate Si content in alpha phase (Al15Si2M4)
+import numpy as np
+import matplotlib.pyplot as plt
+from tc_python import *
+from tc_python import SingleEquilibriumCalculation
+
+"""
+Goal:
+- Plot Si content in Al15Si2M4 phase vs temperature (0°C to 700°C)
+- Fixed Mg content = 1.5 wt%
+- Other alloying elements constant
+"""
+
+# Temperature range (°C → K)
+temperatures_C = np.arange(25, 701, 25)  # 0°C to 700°C
+temperatures_K = temperatures_C + 273.15
+
+# Fixed Mg content
+Mg_content = 1.5  # wt%
+Cr_content =0.0
+# Initialize list for Si content
+Si_content_list = []
+
+with TCPython() as session:
+    # Define system
+    system = session.select_database_and_elements("TCAL9", ["AL", "Si", "Fe", "Cu", "Mn", "Mg"]).get_system()
+    calculator: SingleEquilibriumCalculation = system.with_single_equilibrium_calculation()
+
+    # Set constant composition conditions
+    calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Si"), 0.0028)
+    calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Fe"), 0.0053)
+    calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Cu"), 0.0018)
+    calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Mn"), 0.0075)
+    calculator.set_condition(ThermodynamicQuantity.mass_fraction_of_a_component("Mg"), Mg_content / 100)
+
+
+    # Loop through temperatures
+    for T in temperatures_K:
+        calculator.set_condition("T", T)
+        result = calculator.calculate()
+
+        # Extract Si content in Al15Si2M4 phase (wt%)
+        Si_content = result.get_value_of(
+            ThermodynamicQuantity.composition_of_phase_as_weight_fraction("AL15SI2M4", "Si")) * 100
+        Si_content_list.append(Si_content)
+
+# Plot Si content vs temperature
+
+plt.figure(figsize=(8, 6))
+plt.plot(temperatures_C, Si_content_list, marker='o', color='b')
+plt.title("Si Content in AL15SI2M4 Phase vs Temperature (Mg = 1.5 wt%, Cr=0.0 wt%)")
+plt.xlabel("Temperature (°C)")
+plt.ylabel("Mg Content in FCC (%)")
+#plt.yticks(np.arange(0.0, 0.6, 0.1))
+plt.grid(True)
+plt.show()
