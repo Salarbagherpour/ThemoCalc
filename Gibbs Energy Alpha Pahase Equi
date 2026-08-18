@@ -1,477 +1,637 @@
-import numpy as np
+"""
+Calculate equilibrium phase volume fractions with Thermo-Calc/TC-Python.
+
+Input:
+    6000.csv with composition columns in wt%:
+    Cu, Fe, Mg, Mn, Si, Cr
+
+Output:
+    phase_volume_fraction_equilibrium_600_350_100C.xlsx
+
+Run from PyCharm after selecting the Python interpreter where TC-Python,
+pandas, numpy, and openpyxl are installed.
+"""
+
+from datetime import datetime
+from pathlib import Path
+
 import pandas as pd
-import time
-import os
 from tc_python import *
 
 
-# ============================================================
-# User settings
-# ============================================================
+# ==================================================
+# SETTINGS
+# ==================================================
 
-input_file = r"./6000.csv"
-output_file = "Fast_Equilibrium_GM_AL15SI2M4_6000.csv"
+DATABASE = "TCAL10"
+ELEMENTS = ["AL", "SI", "FE", "CU", "MN", "MG", "CR"]
+REPORT_ELEMENTS = ["AL", "SI", "FE", "CU", "MN", "MG", "CR"]
 
-database = "TCAL10"
+INPUT_FILE = Path("6000.csv")
+OUTPUT_FILE = Path("phase_volume_fraction_equilibrium_600_350_100C.xlsx")
 
-base = "Al"
-elem = ["Si", "Fe", "Cu", "Mn", "Mg", "Cr"]
-all_inputs_list = [base] + elem
+TEMPERATURES_C = [600.0, 350.0, 100.0]
+RAMP_STEP_CANDIDATES = [50.0, 25.0, 10.0]
+EXCLUDED_PHASES = {"GAS", "IONIC_LIQ"}
 
-target_phase = "AL15SI2M4"
-
-# Temperature range
-t_high_C = 700.0
-t_low_C = 100.0
-
-# Fast search settings
-coarse_step_C = 50.0      # first scan step
-fine_step_C = 10.0        # final output step
-extra_window_C = 50.0     # add extra range above/below detected region
-
-# Stop control
-stop_after_absent_points = 6
-max_alloys = None         # use None for all alloys, or set e.g. 5 for testing
-
-pressure = 101325.0       # Pa
-
-# Global minimization is accurate but slower.
-# Start with False for speed. If results look wrong, change to True.
-use_global_minimization = False
+# These columns are read as wt% and converted to mass fraction.
+# Al is the balance element and is not set explicitly.
+CHEM_COLS = ["Cu", "Fe", "Mg", "Mn", "Si", "Cr"]
 
 
-# ============================================================
-# Helper functions
-# ============================================================
+# ==================================================
+# HELPERS
+# ==================================================
 
-def c_to_k(t_c):
-    return t_c + 273.15
+def canonical_column_map(df):
+    """Map lowercase CSV headers to their original names."""
+    return {str(col).strip().lower(): col for col in df.columns}
 
 
-def check_input_file(path):
-    print("Current working directory:")
-    print(os.getcwd())
+def require_columns(df, required_cols):
+    column_map = canonical_column_map(df)
+    missing_cols = [
+        col for col in required_cols
+        if col.lower() not in column_map
+    ]
 
-    print("\nLooking for input file:")
-    print(os.path.abspath(path))
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"\nInput file was not found:\n{os.path.abspath(path)}\n\n"
-            f"Put 6000.csv in this folder or use the full file path."
+    if missing_cols:
+        raise ValueError(
+            "Missing required input columns: "
+            + ", ".join(missing_cols)
+            + ". Expected columns are: "
+            + ", ".join(required_cols)
         )
 
-
-def make_temperature_list(t_high, t_low, step):
-    """
-    Creates finite temperature list from high to low.
-    Prevents accidental endless or extremely long loops.
-    """
-    if step <= 0:
-        raise ValueError("Temperature step must be positive.")
-
-    if t_high < t_low:
-        raise ValueError("t_high_C must be larger than t_low_C.")
-
-    n_steps = int(np.floor((t_high - t_low) / step)) + 1
-    temps = [t_high - i * step for i in range(n_steps)]
-
-    # Make sure lower limit is included if needed
-    if temps[-1] > t_low:
-        temps.append(t_low)
-
-    return np.array(temps, dtype=float)
+    return {col: column_map[col.lower()] for col in required_cols}
 
 
-def safe_get_value(result, possible_quantities):
-    """
-    Try different Thermo-Calc console quantities.
-    Returns np.nan if all fail.
-    """
-    for q in possible_quantities:
-        try:
-            return float(result.get_value_of(q))
-        except Exception:
-            pass
-
-    return np.nan
-
-
-def get_phase_amount(result, phase_name):
-    """
-    Try to get phase amount for equilibrium calculation.
-
-    NP(PHASE) is often phase mole amount/fraction type.
-    BP(PHASE) or BS(PHASE) may work depending on TC version/result type.
-    """
-    return safe_get_value(
-        result,
-        [
-            f"NP({phase_name})",
-            f"BP({phase_name})",
-            f"BS({phase_name})",
-            f"NP({phase_name}#1)",
-            f"BP({phase_name}#1)",
-            f"BS({phase_name}#1)",
-        ]
-    )
-
-
-def get_phase_gibbs_energy(result, phase_name):
-    """
-    Molar Gibbs energy of the phase.
-    Usually GM(PHASE), unit usually J/mol.
-    """
-    return safe_get_value(
-        result,
-        [
-            f"GM({phase_name})",
-            f"GM({phase_name}#1)",
-            f"G({phase_name})",
-            f"G({phase_name}#1)",
-        ]
-    )
-
-
-def calculate_one_equilibrium(calculator, row, temperature_C):
-    """
-    Run one equilibrium calculation at one temperature and one composition.
-    """
-
-    temperature_K = c_to_k(temperature_C)
-
-    calculator.set_condition(
-        ThermodynamicQuantity.temperature(),
-        temperature_K
-    )
-
-    calculator.set_condition(
-        ThermodynamicQuantity.pressure(),
-        pressure
-    )
-
-    # Set N-1 composition conditions.
-    # Base Al is automatically balance.
-    for el in elem:
-        calculator.set_condition(
-            ThermodynamicQuantity.mass_fraction_of_a_component(el),
-            row[el] / 100.0
-        )
-
-    result = calculator.calculate()
-
-    phase_amount = get_phase_amount(result, target_phase)
-    phase_present = False
-
-    if not pd.isna(phase_amount) and phase_amount > 1e-12:
-        phase_present = True
-
-    if phase_present:
-        gm = get_phase_gibbs_energy(result, target_phase)
-    else:
-        gm = np.nan
-
+def build_composition_from_row(row, chemistry_columns):
     return {
-        "T_C": temperature_C,
-        "T_K": temperature_K,
-        f"{target_phase}_phase_amount": phase_amount,
-        f"{target_phase}_present": phase_present,
-        f"{target_phase}_GM_J_per_mol": gm
+        "CU": float(row[chemistry_columns["Cu"]]) / 100.0,
+        "FE": float(row[chemistry_columns["Fe"]]) / 100.0,
+        "MG": float(row[chemistry_columns["Mg"]]) / 100.0,
+        "MN": float(row[chemistry_columns["Mn"]]) / 100.0,
+        "SI": float(row[chemistry_columns["Si"]]) / 100.0,
+        "CR": float(row[chemistry_columns["Cr"]]) / 100.0,
     }
 
 
-def make_calculator(system):
-    calc = system.with_single_equilibrium_calculation()
+def set_equilibrium_conditions(calculator, temperature_c, composition):
+    calculator.set_condition("T", temperature_c + 273.15)
+    calculator.set_condition("P", 101325.0)
+    calculator.set_condition("N", 1.0)
 
-    if use_global_minimization:
-        calc = calc.enable_global_minimization()
-
-    return calc
-
-
-# ============================================================
-# Read input file
-# ============================================================
-
-check_input_file(input_file)
-
-df_inp = pd.read_csv(input_file)
-
-print("\nInput columns:")
-print(list(df_inp.columns.values))
-
-missing_cols = [col for col in elem if col not in df_inp.columns]
-if missing_cols:
-    raise ValueError(f"Missing required input columns: {missing_cols}")
-
-input_frame = df_inp[elem]
-input_frame_nonan = input_frame.dropna(axis=0).copy()
-
-if max_alloys is not None:
-    input_frame_nonan = input_frame_nonan.iloc[:max_alloys].copy()
-
-input_values = input_frame_nonan.values.astype(float)
-
-solute_sum = np.sum(input_values, axis=1)
-if np.any(solute_sum > 100.0):
-    bad_rows = input_frame_nonan.index[solute_sum > 100.0].tolist()
-    raise ValueError(
-        f"Some rows have solute sum greater than 100 wt%. Bad rows: {bad_rows}"
-    )
-
-al_content = 100.0 - solute_sum
-al_content = np.reshape(al_content, (len(al_content), -1))
-
-all_chemistries = np.concatenate((al_content, input_values), axis=1)
-
-df_combined_chemistries = pd.DataFrame(
-    all_chemistries,
-    columns=all_inputs_list,
-    index=input_frame_nonan.index
-)
-
-print("\nPrepared compositions:")
-print(df_combined_chemistries.head())
-
-
-# ============================================================
-# Temperature lists
-# ============================================================
-
-coarse_temps_C = make_temperature_list(
-    t_high_C,
-    t_low_C,
-    coarse_step_C
-)
-
-print("\nCoarse temperature list:")
-print(coarse_temps_C)
-
-
-# ============================================================
-# Run Thermo-Calc
-# ============================================================
-
-all_output_rows = []
-failed_cases = []
-
-start_time = time.time()
-
-start_api_server()
-
-try:
-    system = (
-        SetUp()
-        .select_database_and_elements(database, all_inputs_list)
-        .get_system()
-    )
-
-    for index, row in df_combined_chemistries.iterrows():
-
-        print("\n==============================")
-        print(f"Running alloy index: {index}")
-        print(row)
-        print("==============================")
-
-        calculator = make_calculator(system)
-
-        # ====================================================
-        # Step 1: coarse scan to find AL15SI2M4 region
-        # ====================================================
-
-        coarse_results = []
-
-        print("\nStarting coarse scan...")
-
-        for T_C in coarse_temps_C:
-
-            try:
-                r = calculate_one_equilibrium(
-                    calculator=calculator,
-                    row=row,
-                    temperature_C=T_C
-                )
-
-                coarse_results.append(r)
-
-                print(
-                    f"Coarse T = {T_C:.1f} C, "
-                    f"present = {r[f'{target_phase}_present']}, "
-                    f"amount = {r[f'{target_phase}_phase_amount']}"
-                )
-
-            except Exception as e:
-                print(f"Coarse scan failed at alloy {index}, T = {T_C} C")
-                print(e)
-
-                failed_cases.append({
-                    "Input_index": index,
-                    "T_C": T_C,
-                    "Stage": "coarse",
-                    "Error": str(e)
-                })
-
-        df_coarse = pd.DataFrame(coarse_results)
-
-        if df_coarse.empty:
-            print(f"No coarse results for alloy {index}. Skipping this alloy.")
-            continue
-
-        present_rows = df_coarse[
-            df_coarse[f"{target_phase}_present"] == True
-        ]
-
-        # If AL15SI2M4 is never present, save coarse info and skip fine scan.
-        if present_rows.empty:
-            print(
-                f"{target_phase} was not present in coarse scan "
-                f"for alloy index {index}. Skipping fine scan."
-            )
-
-            for _, rr in df_coarse.iterrows():
-                output_row = {
-                    "Input_index": index,
-                    "Scan_type": "coarse_only_no_phase",
-                    "Target_phase": target_phase,
-                    "Al_wt_percent": row["Al"],
-                    "Si_wt_percent": row["Si"],
-                    "Fe_wt_percent": row["Fe"],
-                    "Cu_wt_percent": row["Cu"],
-                    "Mn_wt_percent": row["Mn"],
-                    "Mg_wt_percent": row["Mg"],
-                    "Cr_wt_percent": row["Cr"],
-                }
-
-                output_row.update(rr.to_dict())
-                all_output_rows.append(output_row)
-
-            pd.DataFrame(all_output_rows).to_csv(output_file, index=False)
-            continue
-
-        # ====================================================
-        # Step 2: define smaller fine scan window
-        # ====================================================
-
-        phase_t_high = present_rows["T_C"].max()
-        phase_t_low = present_rows["T_C"].min()
-
-        fine_high = min(t_high_C, phase_t_high + extra_window_C)
-        fine_low = max(t_low_C, phase_t_low - extra_window_C)
-
-        fine_temps_C = make_temperature_list(
-            fine_high,
-            fine_low,
-            fine_step_C
+    for element, mass_fraction in composition.items():
+        calculator.set_condition(
+            ThermodynamicQuantity.mass_fraction_of_a_component(element),
+            mass_fraction,
         )
 
-        print("\nDetected phase region from coarse scan:")
-        print(f"{phase_t_high:.1f} C down to {phase_t_low:.1f} C")
-
-        print("\nFine scan window:")
-        print(f"{fine_high:.1f} C down to {fine_low:.1f} C")
-
-        print("\nFine temperature list:")
-        print(fine_temps_C)
-
-        # ====================================================
-        # Step 3: fine scan only near AL15SI2M4 region
-        # ====================================================
-
-        absent_after_found = 0
-        found_once = False
-
-        print("\nStarting fine scan...")
-
-        for T_C in fine_temps_C:
-
-            try:
-                r = calculate_one_equilibrium(
-                    calculator=calculator,
-                    row=row,
-                    temperature_C=T_C
-                )
-
-                phase_present = r[f"{target_phase}_present"]
-
-                if phase_present:
-                    found_once = True
-                    absent_after_found = 0
-                else:
-                    if found_once:
-                        absent_after_found += 1
-
-                output_row = {
-                    "Input_index": index,
-                    "Scan_type": "fine",
-                    "Target_phase": target_phase,
-                    "Al_wt_percent": row["Al"],
-                    "Si_wt_percent": row["Si"],
-                    "Fe_wt_percent": row["Fe"],
-                    "Cu_wt_percent": row["Cu"],
-                    "Mn_wt_percent": row["Mn"],
-                    "Mg_wt_percent": row["Mg"],
-                    "Cr_wt_percent": row["Cr"],
-                }
-
-                output_row.update(r)
-                all_output_rows.append(output_row)
-
-                print(
-                    f"Fine T = {T_C:.1f} C, "
-                    f"present = {phase_present}, "
-                    f"amount = {r[f'{target_phase}_phase_amount']}, "
-                    f"GM = {r[f'{target_phase}_GM_J_per_mol']}"
-                )
-
-                # Stop early after phase disappears
-                if absent_after_found >= stop_after_absent_points:
-                    print(
-                        f"Stopping fine scan for alloy {index}: "
-                        f"{target_phase} disappeared for "
-                        f"{stop_after_absent_points} consecutive points."
-                    )
-                    break
-
-            except Exception as e:
-                print(f"Fine scan failed at alloy {index}, T = {T_C} C")
-                print(e)
-
-                failed_cases.append({
-                    "Input_index": index,
-                    "T_C": T_C,
-                    "Stage": "fine",
-                    "Error": str(e)
-                })
-
-        # Save after each alloy
-        pd.DataFrame(all_output_rows).to_csv(output_file, index=False)
-        print(f"Saved partial output after alloy {index}")
-
-finally:
-    stop_api_server()
+    return calculator
 
 
-# ============================================================
-# Save final output
-# ============================================================
+def apply_robust_equilibrium_options(calculator):
+    """
+    Use more forgiving equilibrium settings when available.
+    TC-Python names vary between versions, so every option is optional.
+    """
+    try:
+        calculator.enable_global_minimization()
+    except Exception:
+        pass
 
-df_out = pd.DataFrame(all_output_rows)
+    try:
+        options = SingleEquilibriumOptions()
 
-if not df_out.empty:
-    df_out = df_out.sort_values(
-        by=["Input_index", "T_C"],
-        ascending=[True, False]
+        for method_name, value in [
+            ("set_max_no_of_iterations", 2000),
+            ("set_required_accuracy", 1e-5),
+            ("set_global_minimization_max_grid_points", 4000),
+        ]:
+            if hasattr(options, method_name):
+                options = getattr(options, method_name)(value)
+
+        if hasattr(options, "disable_approximate_driving_force_for_metastable_phases"):
+            options = options.disable_approximate_driving_force_for_metastable_phases()
+
+        calculator = calculator.with_options(options)
+
+    except Exception:
+        pass
+
+    return calculator
+
+
+def calculate_equilibrium(system, temperature_c, composition, calculator=None):
+    """
+    Calculate one equilibrium. Reusing the calculator lets Thermo-Calc use the
+    previous higher-temperature result as a better starting point for 100 C.
+    """
+    if calculator is None:
+        calculator = system.with_single_equilibrium_calculation()
+        calculator = apply_robust_equilibrium_options(calculator)
+
+    calculator = set_equilibrium_conditions(
+        calculator,
+        temperature_c,
+        composition,
     )
 
-    df_out.to_csv(output_file, index=False)
+    try:
+        return calculator, calculator.calculate()
+    except Exception:
+        retry_calculator = system.with_single_equilibrium_calculation()
+        retry_calculator = apply_robust_equilibrium_options(retry_calculator)
+        retry_calculator = set_equilibrium_conditions(
+            retry_calculator,
+            temperature_c,
+            composition,
+        )
+        return retry_calculator, retry_calculator.calculate_with_state()
 
-end_time = time.time()
 
-print("\nCalculation finished.")
-print("Calculation time:", end_time - start_time, "seconds")
-print("Output file:", output_file)
+def make_temperature_ramp(previous_temperature_c, target_temperature_c, step_c):
+    if previous_temperature_c is None:
+        return [target_temperature_c]
 
-if failed_cases:
-    failed_file = "Failed_cases_Equilibrium_GM_AL15SI2M4.csv"
-    pd.DataFrame(failed_cases).to_csv(failed_file, index=False)
-    print("Failed cases file:", failed_file)
+    if previous_temperature_c == target_temperature_c:
+        return [target_temperature_c]
+
+    direction = -1.0 if target_temperature_c < previous_temperature_c else 1.0
+    step_c = abs(step_c) * direction
+    temperatures = []
+    current_temperature_c = previous_temperature_c + step_c
+
+    if direction < 0:
+        while current_temperature_c > target_temperature_c:
+            temperatures.append(round(current_temperature_c, 8))
+            current_temperature_c += step_c
+    else:
+        while current_temperature_c < target_temperature_c:
+            temperatures.append(round(current_temperature_c, 8))
+            current_temperature_c += step_c
+
+    temperatures.append(target_temperature_c)
+    return temperatures
+
+
+def calculate_requested_temperature(
+    system,
+    target_temperature_c,
+    composition,
+    previous_temperature_c=None,
+    calculator=None,
+):
+    try:
+        return calculate_equilibrium(
+            system,
+            target_temperature_c,
+            composition,
+            calculator,
+        )
+    except Exception as direct_error:
+        last_error = direct_error
+
+    for ramp_step_c in RAMP_STEP_CANDIDATES:
+        try:
+            ramp_calculator = None
+
+            if previous_temperature_c is not None:
+                ramp_calculator, _ = calculate_equilibrium(
+                    system,
+                    previous_temperature_c,
+                    composition,
+                    ramp_calculator,
+                )
+
+            ramp = make_temperature_ramp(
+                previous_temperature_c,
+                target_temperature_c,
+                ramp_step_c,
+            )
+
+            ramp_result = None
+            for ramp_temperature_c in ramp:
+                if ramp_temperature_c != target_temperature_c:
+                    print(
+                        "  stabilizing at "
+                        f"{ramp_temperature_c:g} C before "
+                        f"{target_temperature_c:g} C ..."
+                    )
+
+                ramp_calculator, ramp_result = calculate_equilibrium(
+                    system,
+                    ramp_temperature_c,
+                    composition,
+                    ramp_calculator,
+                )
+
+            return ramp_calculator, ramp_result
+
+        except Exception as ramp_error:
+            last_error = ramp_error
+
+    raise last_error
+
+
+def get_present_phases(result):
+    method_names = [
+        "get_stable_phases",
+        "get_present_phases",
+        "get_phases",
+        "stable_phases",
+        "present_phases",
+        "phases",
+    ]
+
+    for method_name in method_names:
+        if not hasattr(result, method_name):
+            continue
+
+        try:
+            method = getattr(result, method_name)
+            value = method() if callable(method) else method
+            if value is None:
+                continue
+
+            phases = sorted({
+                str(phase)
+                for phase in list(value)
+                if str(phase) and str(phase).upper() not in EXCLUDED_PHASES
+            })
+            if phases:
+                return phases
+
+        except Exception:
+            continue
+
+    return []
+
+
+def safe_phase_volume_fraction(result, phase_name):
+    try:
+        value = result.get_value_of(
+            ThermodynamicQuantity.volume_fraction_of_a_phase(phase_name)
+        )
+        if value is None or pd.isna(value):
+            return 0.0
+        return max(0.0, float(value))
+    except Exception:
+        return 0.0
+
+
+def make_thermodynamic_quantity(factory_name, *args):
+    factory = getattr(ThermodynamicQuantity, factory_name, None)
+    if factory is None:
+        return None
+
+    try:
+        return factory(*args)
+    except Exception:
+        return None
+
+
+def safe_element_weight_fraction_in_phase(result, phase_name, element):
+    """
+    Return wt% of an element inside a phase.
+
+    Example:
+        Fe wt% in AL15SI2M4, or Mg wt% in T_PHASE.
+
+    The Console Mode string W(PHASE,ELEMENT) is used as a fallback because
+    TC-Python factory method names differ between Thermo-Calc versions.
+    """
+    quantity_candidates = [
+        make_thermodynamic_quantity(
+            "mass_fraction_of_a_component_in_a_phase",
+            element,
+            phase_name,
+        ),
+        make_thermodynamic_quantity(
+            "mass_fraction_of_component_in_phase",
+            element,
+            phase_name,
+        ),
+        make_thermodynamic_quantity(
+            "mass_fraction_of_a_component_in_phase",
+            element,
+            phase_name,
+        ),
+        f"W({phase_name},{element})",
+    ]
+
+    for quantity in quantity_candidates:
+        if quantity is None:
+            continue
+
+        try:
+            value = result.get_value_of(quantity)
+            if value is None or pd.isna(value):
+                return 0.0
+            return max(0.0, float(value) * 100.0)
+        except Exception:
+            continue
+
+    return 0.0
+
+
+def clean_input(input_file):
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {input_file.resolve()}"
+        )
+
+    input_df = pd.read_csv(input_file)
+
+    if "Index" not in input_df.columns:
+        input_df.insert(0, "Index", range(1, len(input_df) + 1))
+
+    chemistry_columns = require_columns(input_df, CHEM_COLS)
+
+    for original_col in chemistry_columns.values():
+        input_df[original_col] = pd.to_numeric(
+            input_df[original_col],
+            errors="coerce",
+        )
+
+    bad_rows = input_df[
+        input_df[list(chemistry_columns.values())].isna().any(axis=1)
+    ].copy()
+    valid_df = input_df.dropna(
+        subset=list(chemistry_columns.values())
+    ).copy()
+
+    return valid_df, bad_rows, chemistry_columns
+
+
+# ==================================================
+# MAIN CALCULATION
+# ==================================================
+
+def main():
+    input_df, bad_rows, chemistry_columns = clean_input(INPUT_FILE)
+
+    print(f"Valid compositions loaded: {len(input_df)}")
+    if len(bad_rows) > 0:
+        print("Rows skipped because of missing/non-numeric chemistry:")
+        print(bad_rows[["Index"] + list(chemistry_columns.values())])
+
+    result_rows = []
+    phase_element_rows = []
+    error_rows = []
+    detected_phases = set()
+    sorted_temperatures_c = sorted(TEMPERATURES_C, reverse=True)
+
+    with TCPython() as session:
+        system = (
+            session
+            .select_database_and_elements(DATABASE, ELEMENTS)
+            .get_system()
+        )
+
+        for _, input_row in input_df.iterrows():
+            alloy_id = input_row["Index"]
+            composition = build_composition_from_row(
+                input_row,
+                chemistry_columns,
+            )
+
+            sum_solutes = sum(composition.values())
+            if sum_solutes >= 1.0:
+                error_rows.append({
+                    "Alloy_ID": alloy_id,
+                    "Temperature_C": None,
+                    "Error": (
+                        "Sum of solute mass fractions >= 1.0 "
+                        f"({sum_solutes:.6f})"
+                    ),
+                })
+                continue
+
+            alloy_calculator = None
+            previous_temperature_c = None
+
+            for temperature_c in sorted_temperatures_c:
+                print(
+                    f"Running composition {alloy_id} at "
+                    f"{temperature_c:g} C ..."
+                )
+
+                try:
+                    alloy_calculator, calculation_result = calculate_requested_temperature(
+                        system,
+                        temperature_c,
+                        composition,
+                        previous_temperature_c,
+                        alloy_calculator,
+                    )
+                    previous_temperature_c = temperature_c
+
+                    present_phases = get_present_phases(calculation_result)
+                    detected_phases.update(present_phases)
+
+                    output_row = {
+                        "Alloy_ID": alloy_id,
+                        "Temperature_C": temperature_c,
+                    }
+
+                    for chem_col in CHEM_COLS:
+                        output_row[f"{chem_col}_wt_percent"] = float(
+                            input_row[chemistry_columns[chem_col]]
+                        )
+
+                    for phase in present_phases:
+                        phase_vf_percent = safe_phase_volume_fraction(
+                            calculation_result,
+                            phase,
+                        ) * 100.0
+
+                        output_row[phase] = phase_vf_percent
+
+                        phase_element_row = {
+                            "Alloy_ID": alloy_id,
+                            "Temperature_C": temperature_c,
+                            "Phase": phase,
+                            "Phase_volume_fraction_percent": phase_vf_percent,
+                        }
+
+                        for chem_col in CHEM_COLS:
+                            phase_element_row[f"{chem_col}_alloy_wt_percent"] = float(
+                                input_row[chemistry_columns[chem_col]]
+                            )
+
+                        phase_element_row["Al_alloy_wt_percent"] = (
+                            100.0
+                            - sum(
+                                float(input_row[chemistry_columns[chem_col]])
+                                for chem_col in CHEM_COLS
+                            )
+                        )
+
+                        for element in REPORT_ELEMENTS:
+                            phase_element_row[
+                                f"{element}_in_phase_wt_percent"
+                            ] = safe_element_weight_fraction_in_phase(
+                                calculation_result,
+                                phase,
+                                element,
+                            )
+
+                        phase_element_rows.append(phase_element_row)
+
+                    result_rows.append(output_row)
+
+                except Exception as exc:
+                    alloy_calculator = None
+                    error_rows.append({
+                        "Alloy_ID": alloy_id,
+                        "Temperature_C": temperature_c,
+                        "Error": str(exc),
+                    })
+
+    write_output(
+        result_rows,
+        phase_element_rows,
+        error_rows,
+        bad_rows,
+        detected_phases,
+    )
+
+
+def write_output(
+    result_rows,
+    phase_element_rows,
+    error_rows,
+    bad_rows,
+    detected_phases,
+):
+    df_results = pd.DataFrame(result_rows)
+    phase_columns = sorted(detected_phases)
+    composition_columns = [f"{col}_wt_percent" for col in CHEM_COLS]
+
+    for phase in phase_columns:
+        if phase not in df_results.columns:
+            df_results[phase] = 0.0
+
+    if len(df_results) > 0 and phase_columns:
+        df_results[phase_columns] = df_results[phase_columns].fillna(0.0)
+
+    nonzero_phase_columns = [
+        phase for phase in phase_columns
+        if len(df_results) > 0 and (df_results[phase] > 0.0).any()
+    ]
+
+    ordered_columns = (
+        ["Alloy_ID", "Temperature_C"]
+        + composition_columns
+        + nonzero_phase_columns
+    )
+    ordered_columns = [
+        col for col in ordered_columns
+        if col in df_results.columns
+    ]
+
+    if len(df_results) > 0:
+        df_results = df_results[ordered_columns]
+
+    df_long = make_long_results(df_results, nonzero_phase_columns)
+    df_phase_elements = pd.DataFrame(phase_element_rows)
+    df_errors = pd.DataFrame(error_rows)
+
+    if len(df_phase_elements) > 0:
+        phase_element_columns = (
+            ["Alloy_ID", "Temperature_C", "Phase", "Phase_volume_fraction_percent"]
+            + [f"{col}_alloy_wt_percent" for col in CHEM_COLS]
+            + ["Al_alloy_wt_percent"]
+            + [f"{element}_in_phase_wt_percent" for element in REPORT_ELEMENTS]
+        )
+        phase_element_columns = [
+            col for col in phase_element_columns
+            if col in df_phase_elements.columns
+        ]
+        df_phase_elements = df_phase_elements[phase_element_columns]
+
+    output_file = OUTPUT_FILE
+
+    try:
+        write_excel_workbook(
+            output_file,
+            df_results,
+            df_long,
+            df_phase_elements,
+            df_errors,
+            bad_rows,
+        )
+    except PermissionError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = OUTPUT_FILE.with_name(
+            f"{OUTPUT_FILE.stem}_{timestamp}{OUTPUT_FILE.suffix}"
+        )
+        print(
+            f"Could not write {OUTPUT_FILE} because it is open or locked. "
+            f"Writing {output_file} instead."
+        )
+        write_excel_workbook(
+            output_file,
+            df_results,
+            df_long,
+            df_phase_elements,
+            df_errors,
+            bad_rows,
+        )
+
+    print(f"Done. Results exported to: {output_file.resolve()}")
+
+
+def write_excel_workbook(
+    output_file,
+    df_results,
+    df_long,
+    df_phase_elements,
+    df_errors,
+    bad_rows,
+):
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df_results.to_excel(
+            writer,
+            sheet_name="Phase_VF_wide",
+            index=False,
+        )
+        df_long.to_excel(
+            writer,
+            sheet_name="Phase_VF_long",
+            index=False,
+        )
+        df_phase_elements.to_excel(
+            writer,
+            sheet_name="Phase_Element_wt_percent",
+            index=False,
+        )
+        if len(df_errors) > 0:
+            df_errors.to_excel(writer, sheet_name="Errors", index=False)
+        if len(bad_rows) > 0:
+            bad_rows.to_excel(writer, sheet_name="Bad_Input_Rows", index=False)
+
+
+def make_long_results(df_results, phase_columns):
+    if len(df_results) == 0 or not phase_columns:
+        return pd.DataFrame(
+            columns=["Alloy_ID", "Temperature_C", "Phase", "Volume_fraction_percent"]
+        )
+
+    id_columns = [
+        col for col in df_results.columns
+        if col not in phase_columns
+    ]
+
+    return df_results.melt(
+        id_vars=id_columns,
+        value_vars=phase_columns,
+        var_name="Phase",
+        value_name="Volume_fraction_percent",
+    )
+
+
+if __name__ == "__main__":
+    main()
