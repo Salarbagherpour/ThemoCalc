@@ -1,7 +1,42 @@
-"C:\Program Files\Thermo-Calc\2026a\python\python.exe" "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\Equi-Phase Fraction-Multy Comp..py" 
-  File "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\Equi-Phase Fraction-Multy Comp..py", line 193
-    if value is None or pd.isna(value):
-    ^
-IndentationError: expected an indented block after 'if' statement on line 192
+"C:\Program Files\Thermo-Calc\2026a\python\python.exe" "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\Equi-Phase -Elemen wt%.py" 
+Valid compositions loaded: 4
+17:54:13,080 [Thread-1] INFO  CalculationEngine: Starting Thermo-Calc 2026a, Java-version: 25.0.1
+17:54:13,874 [Thread-1] INFO  CalculationEngine: Opening database::TCAL9::
+17:54:15,341 [Thread-1] INFO  JavaWrapper: *** Invoking Gibbs Energy System v6 ***
+Running composition 1.0 at 570 C ...
+Running composition 1.0 at 350 C ...
+17:54:33,746 [Thread-1] INFO  CalculationEngine:  Creating a new composition set FCC_A1#2
+17:54:33,748 [Thread-1] INFO  CalculationEngine: New CS: FCC_A1#2
+Running composition 1.0 at 100 C ...
+Running composition 2.0 at 570 C ...
+Running composition 2.0 at 350 C ...
+17:54:46,737 [Thread-1] INFO  CalculationEngine:  Creating a new composition set FCC_A1#2
+17:54:46,738 [Thread-1] INFO  CalculationEngine: New CS: FCC_A1#2
+Running composition 2.0 at 100 C ...
+17:55:08,390 [Thread-1] INFO  CalculationEngine:   *** ERROR  1611 IN QTHISS: TOO MANY ITERATIONS
+17:55:29,331 [pool-6-thread-1] INFO  CalculationEngine:   *** ERROR  1611 IN QTHISS: TOO MANY ITERATIONS
+Running composition 3.0 at 570 C ...
+Running composition 3.0 at 350 C ...
+Running composition 3.0 at 100 C ...
+Running composition 4.0 at 570 C ...
+Running composition 4.0 at 350 C ...
+Running composition 4.0 at 100 C ...
+Traceback (most recent call last):
+  File "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\Equi-Phase -Elemen wt%.py", line 508, in <module>
+    main()
+  File "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\Equi-Phase -Elemen wt%.py", line 402, in main
+    write_output(
+  File "C:\Users\Public\Documents\Thermo-Calc\2024b\SDK\TC-Python\Examples\Equi-Phase -Elemen wt%.py", line 464, in write_output
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\excel\_openpyxl.py", line 61, in __init__
+    super().__init__(
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\excel\_base.py", line 1246, in __init__
+    self._handles = get_handle(
+                    ^^^^^^^^^^^
+  File "C:\Program Files\Thermo-Calc\2026a\python\Lib\site-packages\pandas\io\common.py", line 882, in get_handle
+    handle = open(handle, ioargs.mode)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'phase_volume_fraction_equilibrium_600_350_100C.xlsx'
 
 Process finished with exit code 1
