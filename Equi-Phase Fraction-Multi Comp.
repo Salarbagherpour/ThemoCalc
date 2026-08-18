@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from tc_python import TCPython, ThermodynamicQuantity
+from tc_python import *
 
 
 # ==================================================
@@ -89,6 +90,66 @@ def set_equilibrium_conditions(calculator, temperature_c, composition):
     return calculator
 
 
+def apply_robust_equilibrium_options(calculator):
+    """
+    Use more forgiving equilibrium settings when available.
+    TC-Python names vary between versions, so every option is optional.
+    """
+    try:
+        calculator.enable_global_minimization()
+    except Exception:
+        pass
+
+    try:
+        options = SingleEquilibriumOptions()
+
+        for method_name, value in [
+            ("set_max_no_of_iterations", 2000),
+            ("set_required_accuracy", 1e-5),
+            ("set_global_minimization_max_grid_points", 4000),
+        ]:
+            if hasattr(options, method_name):
+                options = getattr(options, method_name)(value)
+
+        if hasattr(options, "disable_approximate_driving_force_for_metastable_phases"):
+            options = options.disable_approximate_driving_force_for_metastable_phases()
+
+        calculator = calculator.with_options(options)
+
+    except Exception:
+        pass
+
+    return calculator
+
+
+def calculate_equilibrium(system, temperature_c, composition, calculator=None):
+    """
+    Calculate one equilibrium. Reusing the calculator lets Thermo-Calc use the
+    previous higher-temperature result as a better starting point for 100 C.
+    """
+    if calculator is None:
+        calculator = system.with_single_equilibrium_calculation()
+        calculator = apply_robust_equilibrium_options(calculator)
+
+    calculator = set_equilibrium_conditions(
+        calculator,
+        temperature_c,
+        composition,
+    )
+
+    try:
+        return calculator, calculator.calculate()
+    except Exception:
+        retry_calculator = system.with_single_equilibrium_calculation()
+        retry_calculator = apply_robust_equilibrium_options(retry_calculator)
+        retry_calculator = set_equilibrium_conditions(
+            retry_calculator,
+            temperature_c,
+            composition,
+        )
+        return retry_calculator, retry_calculator.calculate_with_state()
+
+
 def get_present_phases(result):
     method_names = [
         "get_stable_phases",
@@ -129,6 +190,7 @@ def safe_phase_volume_fraction(result, phase_name):
             ThermodynamicQuantity.volume_fraction_of_a_phase(phase_name)
         )
         if value is None or np.isnan(value):
+        if value is None or pd.isna(value):
             return 0.0
         return max(0.0, float(value))
     except Exception:
@@ -206,6 +268,8 @@ def main():
                 })
                 continue
 
+            alloy_calculator = None
+
             for temperature_c in TEMPERATURES_C:
                 print(
                     f"Running composition {alloy_id} at "
@@ -216,8 +280,11 @@ def main():
                     calculator = system.with_single_equilibrium_calculation()
                     calculator = set_equilibrium_conditions(
                         calculator,
+                    alloy_calculator, calculation_result = calculate_equilibrium(
+                        system,
                         temperature_c,
                         composition,
+                        alloy_calculator,
                     )
                     calculation_result = calculator.calculate()
 
