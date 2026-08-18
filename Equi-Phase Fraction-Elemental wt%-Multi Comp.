@@ -12,6 +12,7 @@ Run from PyCharm after selecting the Python interpreter where TC-Python,
 pandas, numpy, and openpyxl are installed.
 """
 
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +31,7 @@ INPUT_FILE = Path("6000.csv")
 OUTPUT_FILE = Path("phase_volume_fraction_equilibrium_600_350_100C.xlsx")
 
 TEMPERATURES_C = [600.0, 350.0, 100.0]
+RAMP_STEP_CANDIDATES = [50.0, 25.0, 10.0]
 EXCLUDED_PHASES = {"GAS", "IONIC_LIQ"}
 
 # These columns are read as wt% and converted to mass fraction.
@@ -147,6 +149,90 @@ def calculate_equilibrium(system, temperature_c, composition, calculator=None):
             composition,
         )
         return retry_calculator, retry_calculator.calculate_with_state()
+
+
+def make_temperature_ramp(previous_temperature_c, target_temperature_c, step_c):
+    if previous_temperature_c is None:
+        return [target_temperature_c]
+
+    if previous_temperature_c == target_temperature_c:
+        return [target_temperature_c]
+
+    direction = -1.0 if target_temperature_c < previous_temperature_c else 1.0
+    step_c = abs(step_c) * direction
+    temperatures = []
+    current_temperature_c = previous_temperature_c + step_c
+
+    if direction < 0:
+        while current_temperature_c > target_temperature_c:
+            temperatures.append(round(current_temperature_c, 8))
+            current_temperature_c += step_c
+    else:
+        while current_temperature_c < target_temperature_c:
+            temperatures.append(round(current_temperature_c, 8))
+            current_temperature_c += step_c
+
+    temperatures.append(target_temperature_c)
+    return temperatures
+
+
+def calculate_requested_temperature(
+    system,
+    target_temperature_c,
+    composition,
+    previous_temperature_c=None,
+    calculator=None,
+):
+    try:
+        return calculate_equilibrium(
+            system,
+            target_temperature_c,
+            composition,
+            calculator,
+        )
+    except Exception as direct_error:
+        last_error = direct_error
+
+    for ramp_step_c in RAMP_STEP_CANDIDATES:
+        try:
+            ramp_calculator = None
+
+            if previous_temperature_c is not None:
+                ramp_calculator, _ = calculate_equilibrium(
+                    system,
+                    previous_temperature_c,
+                    composition,
+                    ramp_calculator,
+                )
+
+            ramp = make_temperature_ramp(
+                previous_temperature_c,
+                target_temperature_c,
+                ramp_step_c,
+            )
+
+            ramp_result = None
+            for ramp_temperature_c in ramp:
+                if ramp_temperature_c != target_temperature_c:
+                    print(
+                        "  stabilizing at "
+                        f"{ramp_temperature_c:g} C before "
+                        f"{target_temperature_c:g} C ..."
+                    )
+
+                ramp_calculator, ramp_result = calculate_equilibrium(
+                    system,
+                    ramp_temperature_c,
+                    composition,
+                    ramp_calculator,
+                )
+
+            return ramp_calculator, ramp_result
+
+        except Exception as ramp_error:
+            last_error = ramp_error
+
+    raise last_error
 
 
 def get_present_phases(result):
@@ -295,6 +381,7 @@ def main():
     phase_element_rows = []
     error_rows = []
     detected_phases = set()
+    sorted_temperatures_c = sorted(TEMPERATURES_C, reverse=True)
 
     with TCPython() as session:
         system = (
@@ -323,20 +410,23 @@ def main():
                 continue
 
             alloy_calculator = None
+            previous_temperature_c = None
 
-            for temperature_c in TEMPERATURES_C:
+            for temperature_c in sorted_temperatures_c:
                 print(
                     f"Running composition {alloy_id} at "
                     f"{temperature_c:g} C ..."
                 )
 
                 try:
-                    alloy_calculator, calculation_result = calculate_equilibrium(
+                    alloy_calculator, calculation_result = calculate_requested_temperature(
                         system,
                         temperature_c,
                         composition,
+                        previous_temperature_c,
                         alloy_calculator,
                     )
+                    previous_temperature_c = temperature_c
 
                     present_phases = get_present_phases(calculation_result)
                     detected_phases.update(present_phases)
@@ -393,6 +483,7 @@ def main():
                     result_rows.append(output_row)
 
                 except Exception as exc:
+                    alloy_calculator = None
                     error_rows.append({
                         "Alloy_ID": alloy_id,
                         "Temperature_C": temperature_c,
@@ -461,7 +552,47 @@ def write_output(
         ]
         df_phase_elements = df_phase_elements[phase_element_columns]
 
-    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+    output_file = OUTPUT_FILE
+
+    try:
+        write_excel_workbook(
+            output_file,
+            df_results,
+            df_long,
+            df_phase_elements,
+            df_errors,
+            bad_rows,
+        )
+    except PermissionError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = OUTPUT_FILE.with_name(
+            f"{OUTPUT_FILE.stem}_{timestamp}{OUTPUT_FILE.suffix}"
+        )
+        print(
+            f"Could not write {OUTPUT_FILE} because it is open or locked. "
+            f"Writing {output_file} instead."
+        )
+        write_excel_workbook(
+            output_file,
+            df_results,
+            df_long,
+            df_phase_elements,
+            df_errors,
+            bad_rows,
+        )
+
+    print(f"Done. Results exported to: {output_file.resolve()}")
+
+
+def write_excel_workbook(
+    output_file,
+    df_results,
+    df_long,
+    df_phase_elements,
+    df_errors,
+    bad_rows,
+):
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         df_results.to_excel(
             writer,
             sheet_name="Phase_VF_wide",
@@ -481,8 +612,6 @@ def write_output(
             df_errors.to_excel(writer, sheet_name="Errors", index=False)
         if len(bad_rows) > 0:
             bad_rows.to_excel(writer, sheet_name="Bad_Input_Rows", index=False)
-
-    print(f"Done. Results exported to: {OUTPUT_FILE.resolve()}")
 
 
 def make_long_results(df_results, phase_columns):
