@@ -1,244 +1,389 @@
-import numpy as np
+"""
+Calculate equilibrium phase volume fractions with Thermo-Calc/TC-Python.
+
+Input:
+    6000.csv with composition columns in wt%:
+    Cu, Fe, Mg, Mn, Si, Cr
+
+Output:
+    phase_volume_fraction_equilibrium_600_350_100C.xlsx
+
+Run from PyCharm after selecting the Python interpreter where TC-Python,
+pandas, numpy, and openpyxl are installed.
+"""
+
+from pathlib import Path
+
 import pandas as pd
-import time
 from tc_python import *
 
-# =========================
-# Read input file
-# =========================
 
-df_inp = pd.read_csv('./6000.csv')
-print("Input columns:")
-print(list(df_inp.columns.values))
+# ==================================================
+# SETTINGS
+# ==================================================
 
-inputs_list = ['Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
+DATABASE = "TCAL10"
+ELEMENTS = ["AL", "SI", "FE", "CU", "MN", "MG", "CR"]
 
-input_frame = df_inp[inputs_list]
-input_frame_nonan = input_frame.dropna(axis=0)
-input_values = input_frame_nonan.values
+INPUT_FILE = Path("6000.csv")
+OUTPUT_FILE = Path("phase_volume_fraction_equilibrium_600_350_100C.xlsx")
 
-# Calculate Al balance
-al_content = 100 - np.sum(input_values, axis=1)
-al_content = np.reshape(al_content, (len(al_content), -1))
+TEMPERATURES_C = [600.0, 350.0, 100.0]
+EXCLUDED_PHASES = {"GAS", "IONIC_LIQ"}
 
-all_chemistries = np.concatenate((al_content, input_values), axis=1)
-
-all_inputs_list = ['Al', 'Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
-
-df_combined_chemistries = pd.DataFrame(
-    all_chemistries,
-    columns=all_inputs_list
-)
-
-# =========================
-# TC settings
-# =========================
-
-base = 'Al'
-elem = ['Si', 'Fe', 'Cu', 'Mn', 'Mg', 'Cr']
-
-database = "TCAL10"
-
-t_start = 1600      # K, safer for high Cr alloys
-t_step = 1.0        # K
-min_liq = 0.005
-
-start_api_server()
-
-# =========================
-# Helper functions
-# =========================
-
-def get_unique_phases(rlist):
-    uni_phases = []
-
-    for mixture in rlist.keys():
-        phases = mixture.split(' + ')
-
-        for ph in phases:
-            if ph not in ['LIQUID'] + uni_phases:
-                uni_phases.append(ph)
-
-    return uni_phases
+# These columns are read as wt% and converted to mass fraction.
+# Al is the balance element and is not set explicitly.
+CHEM_COLS = ["Cu", "Fe", "Mg", "Mn", "Si", "Cr"]
 
 
-def extract_final_value(data):
-    data = np.asarray(data)
+# ==================================================
+# HELPERS
+# ==================================================
 
-    values = data[0, :]
-    temps = data[1, :]
-
-    idx = np.argmin(temps)
-
-    return values[idx]
+def canonical_column_map(df):
+    """Map lowercase CSV headers to their original names."""
+    return {str(col).strip().lower(): col for col in df.columns}
 
 
-def get_cr_wt_percent_in_phase(result, phase_name):
-    """
-    Returns Cr wt% in a phase at the final Scheil temperature.
-    """
+def require_columns(df, required_cols):
+    column_map = canonical_column_map(df)
+    missing_cols = [
+        col for col in required_cols
+        if col.lower() not in column_map
+    ]
 
-    try:
-        cr_data = result.get_values_of(
-            ThermodynamicQuantity.composition_of_phase_as_weight_fraction(
-                phase_name,
-                "Cr"
-            ),
-            ScheilQuantity.temperature()
+    if missing_cols:
+        raise ValueError(
+            "Missing required input columns: "
+            + ", ".join(missing_cols)
+            + ". Expected columns are: "
+            + ", ".join(required_cols)
         )
 
-        cr_weight_fraction = extract_final_value(cr_data)
-
-        return cr_weight_fraction * 100.0
-
-    except Exception as e:
-        print(f"Could not get Cr in phase {phase_name}: {e}")
-        return np.nan
+    return {col: column_map[col.lower()] for col in required_cols}
 
 
-# =========================
-# Thermo-Calc setup
-# =========================
+def build_composition_from_row(row, chemistry_columns):
+    return {
+        "CU": float(row[chemistry_columns["Cu"]]) / 100.0,
+        "FE": float(row[chemistry_columns["Fe"]]) / 100.0,
+        "MG": float(row[chemistry_columns["Mg"]]) / 100.0,
+        "MN": float(row[chemistry_columns["Mn"]]) / 100.0,
+        "SI": float(row[chemistry_columns["Si"]]) / 100.0,
+        "CR": float(row[chemistry_columns["Cr"]]) / 100.0,
+    }
 
-system = (
-    SetUp()
-    .select_database_and_elements(database, [base] + elem)
-    .get_system()
-)
 
-calculator = (
-    system
-    .with_scheil_calculation()
-    .with_options(ScheilOptions().set_temperature_step(t_step))
-    .with_options(ScheilOptions().terminate_on_fraction_of_liquid_phase(min_liq))
-    .enable_global_minimization()
-    .set_start_temperature(t_start)
-    .set_composition_unit(CompositionUnit.MASS_PERCENT)
-)
+def set_equilibrium_conditions(calculator, temperature_c, composition):
+    calculator.set_condition("T", temperature_c + 273.15)
+    calculator.set_condition("P", 101325.0)
+    calculator.set_condition("N", 1.0)
 
-# =========================
-# Output dataframe
-# =========================
-
-df_ph = df_combined_chemistries[elem].copy()
-all_phases = []
-failed_alloys = []
-
-start_time = time.time()
-
-# =========================
-# Main calculation
-# =========================
-
-def phase_obtain(row_entire):
-
-    index = row_entire[0]
-    row = row_entire[1]
-
-    print("\n==============================")
-    print(f"Running alloy index: {index}")
-    print(row)
-    print("==============================")
-
-    for el in elem:
-        calculator.set_composition(el, row[el])
-
-    try:
-        result = calculator.calculate()
-
-    except Exception as e:
-        print(f"ERROR: Scheil calculation failed for alloy index {index}")
-        print(e)
-        failed_alloys.append(index)
-        return
-
-    try:
-        rlist = result.get_values_grouped_by_stable_phases_of(
-            ScheilQuantity.temperature(),
-            ScheilQuantity.volume_fraction_of_all_solid_phases()
+    for element, mass_fraction in composition.items():
+        calculator.set_condition(
+            ThermodynamicQuantity.mass_fraction_of_a_component(element),
+            mass_fraction,
         )
 
-        phases = get_unique_phases(rlist)
+    return calculator
 
-    except Exception as e:
-        print(f"ERROR: Could not get phases for alloy index {index}")
-        print(e)
-        failed_alloys.append(index)
-        return
 
-    print("Phases found:", phases)
+def apply_robust_equilibrium_options(calculator):
+    """
+    Use more forgiving equilibrium settings when available.
+    TC-Python names vary between versions, so every option is optional.
+    """
+    try:
+        calculator.enable_global_minimization()
+    except Exception:
+        pass
 
-    for ph in phases:
+    try:
+        options = SingleEquilibriumOptions()
 
-        phase_col = ph
-        cr_col = f"{ph}_Cr_wt%"
+        for method_name, value in [
+            ("set_max_no_of_iterations", 2000),
+            ("set_required_accuracy", 1e-5),
+            ("set_global_minimization_max_grid_points", 4000),
+        ]:
+            if hasattr(options, method_name):
+                options = getattr(options, method_name)(value)
 
-        if phase_col not in df_ph.columns:
-            df_ph[phase_col] = 0.0
+        if hasattr(options, "disable_approximate_driving_force_for_metastable_phases"):
+            options = options.disable_approximate_driving_force_for_metastable_phases()
 
-        if cr_col not in df_ph.columns:
-            df_ph[cr_col] = np.nan
+        calculator = calculator.with_options(options)
+
+    except Exception:
+        pass
+
+    return calculator
+
+
+def calculate_equilibrium(system, temperature_c, composition, calculator=None):
+    """
+    Calculate one equilibrium. Reusing the calculator lets Thermo-Calc use the
+    previous higher-temperature result as a better starting point for 100 C.
+    """
+    if calculator is None:
+        calculator = system.with_single_equilibrium_calculation()
+        calculator = apply_robust_equilibrium_options(calculator)
+
+    calculator = set_equilibrium_conditions(
+        calculator,
+        temperature_c,
+        composition,
+    )
+
+    try:
+        return calculator, calculator.calculate()
+    except Exception:
+        retry_calculator = system.with_single_equilibrium_calculation()
+        retry_calculator = apply_robust_equilibrium_options(retry_calculator)
+        retry_calculator = set_equilibrium_conditions(
+            retry_calculator,
+            temperature_c,
+            composition,
+        )
+        return retry_calculator, retry_calculator.calculate_with_state()
+
+
+def get_present_phases(result):
+    method_names = [
+        "get_stable_phases",
+        "get_present_phases",
+        "get_phases",
+        "stable_phases",
+        "present_phases",
+        "phases",
+    ]
+
+    for method_name in method_names:
+        if not hasattr(result, method_name):
+            continue
 
         try:
-            phasefrac = result.get_values_of(
-                ScheilQuantity.volume_fraction_of_a_solid_phase(ph),
-                ScheilQuantity.temperature()
-            )
+            method = getattr(result, method_name)
+            value = method() if callable(method) else method
+            if value is None:
+                continue
 
-            phase_volume_fraction = extract_final_value(phasefrac)
+            phases = sorted({
+                str(phase)
+                for phase in list(value)
+                if str(phase) and str(phase).upper() not in EXCLUDED_PHASES
+            })
+            if phases:
+                return phases
 
-        except Exception as e:
-            print(f"Could not get volume fraction for {ph}: {e}")
-            phase_volume_fraction = np.nan
+        except Exception:
+            continue
 
-        cr_wt_percent = get_cr_wt_percent_in_phase(result, ph)
+    return []
 
-        df_ph.loc[index, phase_col] = phase_volume_fraction
-        df_ph.loc[index, cr_col] = cr_wt_percent
 
-        print(
-            f"{ph}: volume fraction = {phase_volume_fraction}, "
-            f"Cr wt% = {cr_wt_percent}"
+def safe_phase_volume_fraction(result, phase_name):
+    try:
+        value = result.get_value_of(
+            ThermodynamicQuantity.volume_fraction_of_a_phase(phase_name)
+        )
+        if value is None or pd.isna(value):
+            return 0.0
+        return max(0.0, float(value))
+    except Exception:
+        return 0.0
+
+
+def clean_input(input_file):
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {input_file.resolve()}"
         )
 
-        if ph not in all_phases:
-            all_phases.append(ph)
+    input_df = pd.read_csv(input_file)
+
+    if "Index" not in input_df.columns:
+        input_df.insert(0, "Index", range(1, len(input_df) + 1))
+
+    chemistry_columns = require_columns(input_df, CHEM_COLS)
+
+    for original_col in chemistry_columns.values():
+        input_df[original_col] = pd.to_numeric(
+            input_df[original_col],
+            errors="coerce",
+        )
+
+    bad_rows = input_df[
+        input_df[list(chemistry_columns.values())].isna().any(axis=1)
+    ].copy()
+    valid_df = input_df.dropna(
+        subset=list(chemistry_columns.values())
+    ).copy()
+
+    return valid_df, bad_rows, chemistry_columns
 
 
-# =========================
-# Run calculations
-# =========================
+# ==================================================
+# MAIN CALCULATION
+# ==================================================
 
-for row_entire in df_combined_chemistries.iterrows():
-    phase_obtain(row_entire)
+def main():
+    input_df, bad_rows, chemistry_columns = clean_input(INPUT_FILE)
 
-# =========================
-# Reorder columns
-# =========================
+    print(f"Valid compositions loaded: {len(input_df)}")
+    if len(bad_rows) > 0:
+        print("Rows skipped because of missing/non-numeric chemistry:")
+        print(bad_rows[["Index"] + list(chemistry_columns.values())])
 
-ordered_cols = elem.copy()
+    result_rows = []
+    error_rows = []
+    detected_phases = set()
 
-for ph in all_phases:
-    ordered_cols.append(ph)
-    ordered_cols.append(f"{ph}_Cr_wt%")
+    with TCPython() as session:
+        system = (
+            session
+            .select_database_and_elements(DATABASE, ELEMENTS)
+            .get_system()
+        )
 
-df_ph = df_ph[ordered_cols]
+        for _, input_row in input_df.iterrows():
+            alloy_id = input_row["Index"]
+            composition = build_composition_from_row(
+                input_row,
+                chemistry_columns,
+            )
 
-# =========================
-# Save output
-# =========================
+            sum_solutes = sum(composition.values())
+            if sum_solutes >= 1.0:
+                error_rows.append({
+                    "Alloy_ID": alloy_id,
+                    "Temperature_C": None,
+                    "Error": (
+                        "Sum of solute mass fractions >= 1.0 "
+                        f"({sum_solutes:.6f})"
+                    ),
+                })
+                continue
 
-output_file = 'PhaseFractions_and_CrContent_Scheil_6000.csv'
-df_ph.to_csv(output_file, index=False)
+            alloy_calculator = None
 
-end_time = time.time()
+            for temperature_c in TEMPERATURES_C:
+                print(
+                    f"Running composition {alloy_id} at "
+                    f"{temperature_c:g} C ..."
+                )
 
-print("\nCalculation finished.")
-print("Calculation time:", end_time - start_time, "seconds")
-print("Output file:", output_file)
+                try:
+                    alloy_calculator, calculation_result = calculate_equilibrium(
+                        system,
+                        temperature_c,
+                        composition,
+                        alloy_calculator,
+                    )
 
-if failed_alloys:
-    print("Failed alloy indices:")
-    print(failed_alloys)
+                    present_phases = get_present_phases(calculation_result)
+                    detected_phases.update(present_phases)
 
-stop_api_server()
+                    output_row = {
+                        "Alloy_ID": alloy_id,
+                        "Temperature_C": temperature_c,
+                    }
+
+                    for chem_col in CHEM_COLS:
+                        output_row[f"{chem_col}_wt_percent"] = float(
+                            input_row[chemistry_columns[chem_col]]
+                        )
+
+                    for phase in present_phases:
+                        output_row[phase] = (
+                            safe_phase_volume_fraction(
+                                calculation_result,
+                                phase,
+                            ) * 100.0
+                        )
+
+                    result_rows.append(output_row)
+
+                except Exception as exc:
+                    error_rows.append({
+                        "Alloy_ID": alloy_id,
+                        "Temperature_C": temperature_c,
+                        "Error": str(exc),
+                    })
+
+    write_output(result_rows, error_rows, bad_rows, detected_phases)
+
+
+def write_output(result_rows, error_rows, bad_rows, detected_phases):
+    df_results = pd.DataFrame(result_rows)
+    phase_columns = sorted(detected_phases)
+    composition_columns = [f"{col}_wt_percent" for col in CHEM_COLS]
+
+    for phase in phase_columns:
+        if phase not in df_results.columns:
+            df_results[phase] = 0.0
+
+    if len(df_results) > 0 and phase_columns:
+        df_results[phase_columns] = df_results[phase_columns].fillna(0.0)
+
+    nonzero_phase_columns = [
+        phase for phase in phase_columns
+        if len(df_results) > 0 and (df_results[phase] > 0.0).any()
+    ]
+
+    ordered_columns = (
+        ["Alloy_ID", "Temperature_C"]
+        + composition_columns
+        + nonzero_phase_columns
+    )
+    ordered_columns = [
+        col for col in ordered_columns
+        if col in df_results.columns
+    ]
+
+    if len(df_results) > 0:
+        df_results = df_results[ordered_columns]
+
+    df_long = make_long_results(df_results, nonzero_phase_columns)
+    df_errors = pd.DataFrame(error_rows)
+
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        df_results.to_excel(
+            writer,
+            sheet_name="Phase_VF_wide",
+            index=False,
+        )
+        df_long.to_excel(
+            writer,
+            sheet_name="Phase_VF_long",
+            index=False,
+        )
+        if len(df_errors) > 0:
+            df_errors.to_excel(writer, sheet_name="Errors", index=False)
+        if len(bad_rows) > 0:
+            bad_rows.to_excel(writer, sheet_name="Bad_Input_Rows", index=False)
+
+    print(f"Done. Results exported to: {OUTPUT_FILE.resolve()}")
+
+
+def make_long_results(df_results, phase_columns):
+    if len(df_results) == 0 or not phase_columns:
+        return pd.DataFrame(
+            columns=["Alloy_ID", "Temperature_C", "Phase", "Volume_fraction_percent"]
+        )
+
+    id_columns = [
+        col for col in df_results.columns
+        if col not in phase_columns
+    ]
+
+    return df_results.melt(
+        id_vars=id_columns,
+        value_vars=phase_columns,
+        var_name="Phase",
+        value_name="Volume_fraction_percent",
+    )
+
+
+if __name__ == "__main__":
+    main()
